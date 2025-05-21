@@ -225,126 +225,6 @@ class BirdSongPreprocessor:
 
         return signal_chunks, noise_chunks
 
-    def augment_spectrogram(self, spec, noise_specs=None):
-        """
-        Apply domain-specific augmentations to spectrograms as described in BirdNET paper
-
-        Args:
-            spec (torch.Tensor): Input spectrogram
-            noise_specs (list): List of noise spectrograms from non-salient chunks
-        """
-        # Maximum of three augmentations per sample as mentioned in the paper
-        num_augmentations = np.random.randint(1, 4)
-        augmented = spec.clone()
-
-        # List of possible augmentations
-        augmentations = [
-            self._frequency_shift,
-            self._time_shift,
-            self._spec_warp,
-            lambda x: self._add_ambient_noise(x, noise_specs) if noise_specs else x,
-        ]
-
-        # Randomly select and apply augmentations
-        selected_augs = np.random.choice(
-            augmentations,
-            size=min(num_augmentations, len(augmentations)),
-            replace=False,
-        )
-
-        for aug in selected_augs:
-            if np.random.random() > 0.5:  # 0.5 probability as mentioned in paper
-                augmented = aug(augmented)
-
-        return augmented
-
-    def _frequency_shift(self, spec, max_shift=10):
-        """Vertical roll - Shift in frequency domain"""
-        shift = np.random.randint(-max_shift, max_shift)
-        return torch.roll(spec, shifts=shift, dims=1)
-
-    def _time_shift(self, spec, max_shift=50):
-        """Horizontal roll - Shift in time domain"""
-        shift = np.random.randint(-max_shift, max_shift)
-        return torch.roll(spec, shifts=shift, dims=2)
-
-    def _spec_warp(self, spec):
-        """
-        Spectrogram warping similar to SpecAugment
-        Applies random partial stretching in time and frequency
-        """
-        freq_dim, time_dim = spec.shape[1:]
-
-        # Create warping parameters
-        w = np.random.randint(5, 20)  # window size
-        center_freq = np.random.randint(w, freq_dim - w)
-        center_time = np.random.randint(w, time_dim - w)
-
-        # Create warping matrix
-        factor = np.random.uniform(0.8, 1.2)
-        warped = spec.clone()
-
-        # Apply warping around center point
-        warped[
-            :, center_freq - w : center_freq + w, center_time - w : center_time + w
-        ] *= factor
-
-        return warped
-
-    def _add_ambient_noise(self, spec, noise_specs, max_weight=0.5):
-        """
-        Augment signal spectrogram with noise as described in Sprengel et al.
-
-        Args:
-            spec: Signal spectrogram to augment
-            noise_specs: List of noise spectrograms to choose from
-            max_weight: Maximum weight for noise addition
-
-        Returns:
-            Augmented spectrogram
-        """
-        if not noise_specs:
-            return spec
-
-        # Randomly select a noise spectrogram
-        noise_spec = noise_specs[np.random.randint(len(noise_specs))]
-
-        # Ensure shapes match
-        if noise_spec.shape != spec.shape:
-            # Resize noise spectrogram to match signal shape
-            _, freq_dim, time_dim = spec.shape
-
-            # Handle frequency dimension mismatch (shouldn't happen with same preprocessing)
-            if noise_spec.shape[1] != freq_dim:
-                # Interpolate frequency dimension
-                noise_spec = torch.nn.functional.interpolate(
-                    noise_spec, size=(freq_dim, noise_spec.shape[2]), mode="bilinear"
-                )
-
-            # Handle time dimension mismatch
-            if noise_spec.shape[2] != time_dim:
-                # Center crop or pad
-                if noise_spec.shape[2] > time_dim:
-                    # Center crop
-                    start = (noise_spec.shape[2] - time_dim) // 2
-                    noise_spec = noise_spec[:, :, start : start + time_dim]
-                else:
-                    # Pad
-                    pad_size = time_dim - noise_spec.shape[2]
-                    pad_left = pad_size // 2
-                    pad_right = pad_size - pad_left
-                    noise_spec = torch.nn.functional.pad(
-                        noise_spec, (pad_left, pad_right)
-                    )
-
-        # Random weighting for noise (as in paper)
-        weight = np.random.uniform(0, max_weight)
-
-        # Add weighted noise
-        augmented = (1 - weight) * spec + weight * noise_spec
-
-        return augmented
-
     def collect_ambient_noise(self, audio_path):
         """
         Collect non-salient chunks for ambient noise augmentation
@@ -368,20 +248,17 @@ class BirdSongPreprocessor:
         return None
 
 
-def prepare_batch(
-    audio_files, save_dir="train_audio_processed", training=True, show_progress=True
-):
+def prepare_batch(audio_files, save_dir="train_audio_processed", show_progress=True):
     """
     Prepare a batch of audio files for model training or inference.
 
     Args:
         audio_files (list): List of audio file paths
         save_dir (str): Directory to save the processed audio files
-        training (bool): Whether to apply augmentation
         show_progress (bool): Whether to show progress bars
     """
     # Create save_dir if it doesn't exist
-    save_dir = Path(save_dir)
+    save_dir = Path("data", save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Create metadata file to store mapping
@@ -463,13 +340,6 @@ def prepare_batch(
                 # Process audio file into chunks
                 signal_chunks, noise_chunks = preprocessor.process_audio(audio_file)
 
-                # Augment signal chunks if in training mode
-                if training:
-                    signal_chunks = [
-                        preprocessor.augment_spectrogram(chunk, noise_chunks)
-                        for chunk in signal_chunks
-                    ]
-
                 # Save signal chunks
                 for i, chunk in enumerate(signal_chunks):
                     chunk_file = signal_dir / f"{base_filename}_{i:03d}.pt"
@@ -528,20 +398,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess bird audio files")
     parser.add_argument(
         "--input_dir",
+        "-I",
         type=str,
         default="data/train_audio",
         help="Directory containing audio files",
     )
     parser.add_argument(
         "--output_dir",
+        "-O",
         type=str,
         default="train_audio_processed",
         help="Directory to save processed files",
-    )
-    parser.add_argument(
-        "--no_augment",
-        action="store_true",
-        help="Disable augmentation (for validation/test data)",
     )
 
     args = parser.parse_args()
@@ -551,4 +418,4 @@ if __name__ == "__main__":
     print(f"Found {len(audio_files)} audio files")
 
     # Process files
-    prepare_batch(audio_files, save_dir=args.output_dir, training=not args.no_augment)
+    prepare_batch(audio_files, save_dir=args.output_dir)
