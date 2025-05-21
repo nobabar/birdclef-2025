@@ -37,7 +37,7 @@ class BirdSongPreprocessor:
         )
 
     def extract_signal_segments(
-        self, waveform, threshold_factor=3.0, noise_threshold_factor=2.5
+        self, waveform, threshold_factor=3.5, noise_threshold_factor=2.0
     ):
         """
         Extract segments containing bird vocalizations based on signal strength
@@ -45,8 +45,8 @@ class BirdSongPreprocessor:
 
         Args:
             waveform: Input audio waveform
-            threshold_factor: Factor for signal detection (3.0 as in paper)
-            noise_threshold_factor: Factor for noise detection (2.5 as in paper)
+            threshold_factor: Factor for signal detection (3.5 instead of 3.0 in paper)
+            noise_threshold_factor: Factor for noise detection (2.0 instead of 2.5 in paper)
 
         Returns:
             signal_mask: Boolean mask indicating signal segments
@@ -63,17 +63,15 @@ class BirdSongPreprocessor:
         time_medians = torch.median(spec_norm, dim=1, keepdim=True).values
 
         # Select pixels that are N times bigger than both medians
-        # For signal parts (threshold_factor = 3.0)
+        # For signal parts (threshold_factor = 3.5)
         signal_pixels = (spec_norm > (threshold_factor * freq_medians)) & (
             spec_norm > (threshold_factor * time_medians)
         )
 
-        # For noise parts (noise_threshold_factor = 2.5)
-        noise_pixels = (
-            (spec_norm > (noise_threshold_factor * freq_medians))
-            & (spec_norm > (noise_threshold_factor * time_medians))
-            & ~signal_pixels
-        )  # Ensure no overlap with signal
+        # For noise parts (noise_threshold_factor = 2.0)
+        noise_pixels = (spec_norm > (noise_threshold_factor * freq_medians)) & (
+            spec_norm > (noise_threshold_factor * time_medians)
+        )
 
         # Apply binary erosion and dilation to clean up the masks
         # First convert to numpy for morphological operations
@@ -87,27 +85,18 @@ class BirdSongPreprocessor:
         signal_pixels_np = ndimage.binary_erosion(signal_pixels_np, structure=kernel)
         signal_pixels_np = ndimage.binary_dilation(signal_pixels_np, structure=kernel)
 
+        # For noise, just apply erosion to shrink it (no dilation)
         noise_pixels_np = ndimage.binary_erosion(noise_pixels_np, structure=kernel)
-        noise_pixels_np = ndimage.binary_dilation(noise_pixels_np, structure=kernel)
+        # noise_pixels_np = ndimage.binary_dilation(noise_pixels_np, structure=kernel)
 
         # Create indicator vectors (1 if column contains at least one 1)
         signal_indicator = np.any(signal_pixels_np, axis=0).astype(np.uint8)
         noise_indicator = np.any(noise_pixels_np, axis=0).astype(np.uint8)
 
-        # Apply dilation to smooth the indicator vectors
-        dilation_kernel = np.ones(4)
+        # Apply dilation to smooth the signal indicator vector
+        dilation_kernel = np.ones(2)
         signal_indicator = ndimage.binary_dilation(
             signal_indicator, structure=dilation_kernel
-        )
-        signal_indicator = ndimage.binary_dilation(
-            signal_indicator, structure=dilation_kernel
-        )
-
-        noise_indicator = ndimage.binary_dilation(
-            noise_indicator, structure=dilation_kernel
-        )
-        noise_indicator = ndimage.binary_dilation(
-            noise_indicator, structure=dilation_kernel
         )
 
         # Ensure no overlap between signal and noise
@@ -414,7 +403,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Get all .ogg files recursively
-    audio_files = glob.glob(f"{args.input_dir}/**/*.ogg", recursive=True)
+    audio_files = glob.glob(f"{args.input_dir}/21211/*.ogg", recursive=True)
     print(f"Found {len(audio_files)} audio files")
 
     # Process files
