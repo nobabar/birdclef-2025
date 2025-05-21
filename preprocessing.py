@@ -403,7 +403,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Get all .ogg files recursively
-    audio_files = glob.glob(f"{args.input_dir}/21211/*.ogg", recursive=True)
+    audio_files = glob.glob(f"{args.input_dir}/**/*.ogg", recursive=True)
     print(f"Found {len(audio_files)} audio files")
 
     # Process files
