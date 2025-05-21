@@ -162,93 +162,108 @@ class BirdSongPreprocessor:
 
         Args:
             audio_path: Path to audio file
-            chunk_duration: Duration of each chunk in seconds (default: 3.0s)
-            overlap: Overlap between chunks as a fraction (default: 0.5 = 50%)
+            chunk_duration: Duration of each chunk in seconds
+            overlap: Overlap between chunks (0.0-1.0)
 
         Returns:
-            signal_chunks: List of spectrograms from signal parts
-            noise_chunks: List of spectrograms from noise parts
+            signal_chunks: List of mel spectrograms containing bird vocalizations
+            noise_chunks: List of mel spectrograms containing background noise
         """
         # Load audio
         waveform, sr = torchaudio.load(audio_path)
 
         # Resample if necessary
         if sr != self.sample_rate:
-            resampler = AT.Resample(sr, self.sample_rate)
+            resampler = AT.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
+
+        # Convert to mono if stereo
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)
 
-        # Calculate chunk parameters
-        chunk_samples = int(chunk_duration * self.sample_rate)
-        hop_samples = int(chunk_samples * (1 - overlap))
+        # Calculate chunk size and hop size in samples
+        chunk_size = int(chunk_duration * self.sample_rate)
+        hop_size = int(chunk_size * (1 - overlap))
 
-        # Process signal chunks
+        # Calculate number of chunks
+        num_chunks = max(1, int((waveform.shape[1] - chunk_size) / hop_size) + 1)
+
         signal_chunks = []
-        for start in range(
-            0, signal_waveform.shape[1] - chunk_samples + 1, hop_samples
-        ):
-            # Extract chunk
-            chunk = signal_waveform[:, start : start + chunk_samples]
+        noise_chunks = []
 
-            # Skip chunks with no signal
-            if torch.sum(chunk) > 0:
-                # Convert to spectrogram
-                spec = self.mel_spectrogram(chunk)
+        # Process each chunk
+        for i in range(num_chunks):
+            # Calculate start and end indices
+            start = i * hop_size
+            end = start + chunk_size
+
+            # If end is beyond the waveform, pad with zeros
+            if end > waveform.shape[1]:
+                # Create padded chunk
+                signal_chunk = torch.zeros(1, chunk_size, device=waveform.device)
+                noise_chunk = torch.zeros(1, chunk_size, device=waveform.device)
+
+                # Copy available samples
+                signal_chunk[:, : waveform.shape[1] - start] = signal_waveform[
+                    :, start : waveform.shape[1]
+                ]
+                noise_chunk[:, : waveform.shape[1] - start] = noise_waveform[
+                    :, start : waveform.shape[1]
+                ]
+            else:
+                # Extract chunk
+                signal_chunk = signal_waveform[:, start:end]
+                noise_chunk = noise_waveform[:, start:end]
+
+            # Check if signal chunk contains any signal
+            if torch.sum(signal_chunk**2) > 0:
+                # Convert to mel spectrogram
+                spec = self.mel_spectrogram(signal_chunk)
                 spec = torch.log(spec + 1e-9)  # Log scaling
                 signal_chunks.append(spec)
 
-        # Process noise chunks
-        noise_chunks = []
-        for start in range(0, noise_waveform.shape[1] - chunk_samples + 1, hop_samples):
-            # Extract chunk
-            chunk = noise_waveform[:, start : start + chunk_samples]
-
-            # Skip chunks with no noise
-            if torch.sum(chunk) > 0:
-                # Convert to spectrogram
-                spec = self.mel_spectrogram(chunk)
+            # Check if noise chunk contains any noise
+            if torch.sum(noise_chunk**2) > 0:
+                # Convert to mel spectrogram
+                spec = self.mel_spectrogram(noise_chunk)
                 spec = torch.log(spec + 1e-9)  # Log scaling
                 noise_chunks.append(spec)
 
         return signal_chunks, noise_chunks
 
-    def collect_ambient_noise(self, audio_path):
-        """
-        Collect non-salient chunks for ambient noise augmentation
-        Using the improved signal/noise separation method
-        """
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != self.sample_rate:
-            resampler = AT.Resample(sr, self.sample_rate)
-            waveform = resampler(waveform)
 
-        # Separate signal and noise using our new method
-        _, noise_waveform = self.separate_signal_noise(waveform)
-
-        # Check if we have any noise segments
-        if torch.sum(noise_waveform) > 0:
-            # Convert to spectrogram
-            noise_spec = self.mel_spectrogram(noise_waveform)
-            noise_spec = torch.log(noise_spec + 1e-9)
-            return noise_spec
-
-        return None
-
-
-def prepare_batch(audio_files, save_dir="train_audio_processed", show_progress=True):
+def prepare_batch(
+    audio_files,
+    metadata_path="data/train.csv",
+    save_dir="train_audio_processed",
+    show_progress=True,
+):
     """
     Prepare a batch of audio files for model training or inference.
 
     Args:
         audio_files (list): List of audio file paths
+        metadata_path (str): Path to the train.csv file with additional metadata
         save_dir (str): Directory to save the processed audio files
         show_progress (bool): Whether to show progress bars
     """
     # Create save_dir if it doesn't exist
     save_dir = Path("data", save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load train.csv metadata if available
+    train_metadata = {}
+    if metadata_path and os.path.exists(metadata_path):
+        try:
+            train_df = pd.read_csv(metadata_path)
+            for _, row in train_df.iterrows():
+                train_metadata[row["filename"]] = row.to_dict()
+            print(f"Loaded metadata for {len(train_metadata)} files from train.csv")
+        except Exception as e:
+            print(f"Error loading train.csv metadata: {e}")
 
     # Create metadata file to store mapping
     metadata = []
@@ -295,33 +310,52 @@ def prepare_batch(audio_files, save_dir="train_audio_processed", show_progress=T
             signal_pattern = str(signal_dir / f"{base_filename}_*.pt")
             existing_signal_files = glob.glob(signal_pattern)
 
+            # Get filename for metadata lookup
+            rel_path = os.path.relpath(audio_file, "data/train_audio")
+            filename = rel_path.replace("\\", "/")  # Normalize path separators
+            additional_meta = train_metadata.get(filename, {})
+
             if existing_signal_files:
                 # Load existing spectrograms
                 for file in existing_signal_files:
                     spec = torch.load(file)
                     signal_specs.append(spec)
-                    metadata.append(
-                        {
-                            "original_file": audio_file,
-                            "processed_file": file,
-                            "folder": folder,
-                            "type": "signal",
-                        }
-                    )
+
+                    # Create metadata entry with both sources
+                    meta_entry = {
+                        "original_file": audio_file,
+                        "processed_file": file,
+                        "folder": folder,
+                        "type": "signal",
+                    }
+
+                    # Add additional metadata from train.csv
+                    for key, value in additional_meta.items():
+                        if key not in meta_entry:  # Don't overwrite existing keys
+                            meta_entry[f"train_{key}"] = value
+
+                    metadata.append(meta_entry)
 
                 # Load existing noise specs if available
                 noise_pattern = str(noise_dir / f"{base_filename}_*.pt")
                 for file in glob.glob(noise_pattern):
                     spec = torch.load(file)
                     noise_specs.append(spec)
-                    metadata.append(
-                        {
-                            "original_file": audio_file,
-                            "processed_file": file,
-                            "folder": folder,
-                            "type": "noise",
-                        }
-                    )
+
+                    # Create metadata entry with both sources
+                    meta_entry = {
+                        "original_file": audio_file,
+                        "processed_file": file,
+                        "folder": folder,
+                        "type": "noise",
+                    }
+
+                    # Add additional metadata from train.csv
+                    for key, value in additional_meta.items():
+                        if key not in meta_entry:  # Don't overwrite existing keys
+                            meta_entry[f"train_{key}"] = value
+
+                    metadata.append(meta_entry)
 
                 continue
 
@@ -334,30 +368,44 @@ def prepare_batch(audio_files, save_dir="train_audio_processed", show_progress=T
                     chunk_file = signal_dir / f"{base_filename}_{i:03d}.pt"
                     torch.save(chunk, chunk_file)
                     signal_specs.append(chunk)
-                    metadata.append(
-                        {
-                            "original_file": audio_file,
-                            "processed_file": str(chunk_file),
-                            "folder": folder,
-                            "type": "signal",
-                            "chunk_index": i,
-                        }
-                    )
+
+                    # Create metadata entry with both sources
+                    meta_entry = {
+                        "original_file": audio_file,
+                        "processed_file": str(chunk_file),
+                        "folder": folder,
+                        "type": "signal",
+                        "chunk_index": i,
+                    }
+
+                    # Add additional metadata from train.csv
+                    for key, value in additional_meta.items():
+                        if key not in meta_entry:  # Don't overwrite existing keys
+                            meta_entry[f"train_{key}"] = value
+
+                    metadata.append(meta_entry)
 
                 # Save noise chunks
                 for i, chunk in enumerate(noise_chunks):
                     chunk_file = noise_dir / f"{base_filename}_{i:03d}.pt"
                     torch.save(chunk, chunk_file)
                     noise_specs.append(chunk)
-                    metadata.append(
-                        {
-                            "original_file": audio_file,
-                            "processed_file": str(chunk_file),
-                            "folder": folder,
-                            "type": "noise",
-                            "chunk_index": i,
-                        }
-                    )
+
+                    # Create metadata entry with both sources
+                    meta_entry = {
+                        "original_file": audio_file,
+                        "processed_file": str(chunk_file),
+                        "folder": folder,
+                        "type": "noise",
+                        "chunk_index": i,
+                    }
+
+                    # Add additional metadata from train.csv
+                    for key, value in additional_meta.items():
+                        if key not in meta_entry:  # Don't overwrite existing keys
+                            meta_entry[f"train_{key}"] = value
+
+                    metadata.append(meta_entry)
 
             except Exception as e:
                 print(f"\nError processing {audio_file}: {str(e)}")
@@ -376,6 +424,16 @@ def prepare_batch(audio_files, save_dir="train_audio_processed", show_progress=T
         "folder"
     ].value_counts()
     print(folder_counts.head().to_string())
+
+    # Print metadata summary
+    if "train_rating" in metadata_df.columns:
+        print("\nMetadata Summary:")
+        print(f"Files with rating: {metadata_df['train_rating'].notna().sum()}")
+        print(f"Average rating: {metadata_df['train_rating'].mean():.2f}")
+
+    if "train_collection" in metadata_df.columns:
+        print("\nCollection Distribution:")
+        print(metadata_df["train_collection"].value_counts().to_string())
 
     return signal_specs, noise_specs, metadata_df
 
@@ -399,6 +457,13 @@ if __name__ == "__main__":
         default="train_audio_processed",
         help="Directory to save processed files",
     )
+    parser.add_argument(
+        "--metadata",
+        "-M",
+        type=str,
+        default="data/train.csv",
+        help="Path to train.csv with additional metadata",
+    )
 
     args = parser.parse_args()
 
@@ -407,4 +472,4 @@ if __name__ == "__main__":
     print(f"Found {len(audio_files)} audio files")
 
     # Process files
-    prepare_batch(audio_files, save_dir=args.output_dir)
+    prepare_batch(audio_files, metadata_path=args.metadata, save_dir=args.output_dir)
