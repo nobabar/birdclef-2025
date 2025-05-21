@@ -1,0 +1,691 @@
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
+from sklearn.metrics import average_precision_score
+from torch.utils.data import DataLoader, Dataset
+
+
+class BasicBlock(nn.Module):
+    """Basic residual block for ResNet"""
+
+    def __init__(self, in_channels, out_channels, stride=1, dropout_prob=0.5):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout2d(p=dropout_prob)
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, out_channels, kernel_size=1, stride=stride, bias=False
+                ),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class DownsamplingBlock(nn.Module):
+    """Downsampling residual block with strided convolution"""
+
+    def __init__(self, in_channels, out_channels, dropout_prob=0.5):
+        super(DownsamplingBlock, self).__init__()
+        # As per Xie et al., 2018 suggestion for downsampling blocks
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout2d(p=dropout_prob)
+
+        # Shortcut with strided convolution
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class WideResNet(nn.Module):
+    """Wide ResNet implementation based on BirdNET paper"""
+
+    def __init__(self, num_classes, width_factor=4, depth_factor=3, dropout_prob=0.5):
+        super(WideResNet, self).__init__()
+
+        # Initial number of channels (scaled by width factor K)
+        self.init_channels = 16 * width_factor
+
+        # Pre-processing block
+        self.preprocessing = nn.Sequential(
+            nn.Conv2d(
+                1, self.init_channels, kernel_size=5, stride=1, padding=2, bias=False
+            ),
+            nn.BatchNorm2d(self.init_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(1, 2)),  # Pooling in time dimension only
+        )
+
+        # Residual stacks
+        # First stack (no downsampling in first block)
+        self.stack1 = self._make_stack(
+            self.init_channels, self.init_channels, depth_factor, 1, dropout_prob
+        )
+
+        # Second stack (with downsampling)
+        self.stack2 = self._make_stack(
+            self.init_channels, 2 * self.init_channels, depth_factor, 2, dropout_prob
+        )
+
+        # Third stack (with downsampling)
+        self.stack3 = nn.Sequential(
+            DownsamplingBlock(
+                2 * self.init_channels, 4 * self.init_channels, dropout_prob
+            ),
+            *[
+                BasicBlock(
+                    4 * self.init_channels, 4 * self.init_channels, 1, dropout_prob
+                )
+                for _ in range(depth_factor - 1)
+            ],
+        )
+
+        # Classification block (as per Schlüter, 2018)
+        # Assuming input is 64x384, after preprocessing and stacks it becomes:
+        # 64x192 -> 32x96 -> 16x48
+        # So the final feature map size is (batch_size, 4*init_channels, 16, 48)
+
+        # 1x1 convolution to reduce channels
+        self.conv_reduce = nn.Conv2d(
+            4 * self.init_channels, 512, kernel_size=1, bias=False
+        )
+        self.bn_reduce = nn.BatchNorm2d(512)
+
+        # Global pooling and classification
+        self.classifier = nn.Conv2d(512, num_classes, kernel_size=1)
+
+    def _make_stack(self, in_channels, out_channels, num_blocks, stride, dropout_prob):
+        layers = []
+        # First block may have downsampling
+        if stride == 2:
+            layers.append(DownsamplingBlock(in_channels, out_channels, dropout_prob))
+        else:
+            layers.append(BasicBlock(in_channels, out_channels, stride, dropout_prob))
+
+        # Rest of the blocks
+        for _ in range(1, num_blocks):
+            layers.append(BasicBlock(out_channels, out_channels, 1, dropout_prob))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Input shape: [batch_size, 1, 64, 384] (mel spectrogram)
+
+        # Pre-processing
+        out = self.preprocessing(x)  # [batch_size, init_channels, 64, 192]
+
+        # Residual stacks
+        out = self.stack1(out)  # [batch_size, init_channels, 64, 192]
+        out = self.stack2(out)  # [batch_size, 2*init_channels, 32, 96]
+        out = self.stack3(out)  # [batch_size, 4*init_channels, 16, 48]
+
+        # Classification block
+        out = F.relu(self.bn_reduce(self.conv_reduce(out)))  # [batch_size, 512, 16, 48]
+        out = self.classifier(out)  # [batch_size, num_classes, 16, 48]
+
+        # Global log-mean-exponential pooling (as described in the paper)
+        # This produces 3 predictions per 3-second spectrogram (1 per second)
+        out = torch.exp(out)
+        out = torch.mean(out, dim=(2, 3))  # Global average pooling
+        out = torch.log(out + 1e-7)  # Log to stabilize
+
+        # Apply sigmoid activation for multi-label classification
+        out = torch.sigmoid(out)
+
+        return out
+
+
+class BirdSongDataset(Dataset):
+    """Dataset for loading processed bird song spectrograms"""
+
+    def __init__(self, processed_dir, transform=None, augment=False):
+        """
+        Args:
+            processed_dir: Directory with all the processed spectrograms and metadata
+            transform: Optional transform to be applied on a sample
+            augment: Whether to use augmented samples
+        """
+        self.processed_dir = Path(processed_dir)
+        self.transform = transform
+        self.augment = augment
+
+        # Load metadata from the processed directory
+        metadata_path = self.processed_dir / "metadata.csv"
+        self.metadata = pd.read_csv(metadata_path)
+
+        # Filter for signal spectrograms only (not noise)
+        self.metadata = self.metadata[self.metadata["type"] == "signal"]
+
+        # Get unique classes (folders)
+        self.classes = sorted(self.metadata["folder"].unique())
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+
+        print(
+            f"Loaded {len(self.metadata)} signal chunks across {len(self.classes)} classes"
+        )
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        # Get file path directly from metadata
+        file_path = self.metadata.iloc[idx]["processed_file"]
+
+        # Load spectrogram
+        try:
+            spectrogram = torch.load(file_path)
+        except FileNotFoundError:
+            # If the path in metadata is relative, try to resolve it
+            file_path = self.processed_dir / file_path
+            spectrogram = torch.load(file_path)
+
+        # Get label (folder name is the class)
+        folder = self.metadata.iloc[idx]["folder"]
+        label_idx = self.class_to_idx[folder]
+
+        # Convert to one-hot encoding
+        label = torch.zeros(len(self.classes))
+        label[label_idx] = 1.0
+
+        # Get sample weight based on metadata
+        weight = 1.0
+
+        # Adjust weight based on recording quality
+        if "train_rating" in self.metadata.columns and not pd.isna(
+            self.metadata.iloc[idx]["train_rating"]
+        ):
+            rating = self.metadata.iloc[idx]["train_rating"]
+            # Higher rated recordings get higher weights
+            weight *= 1.0 + rating / 5.0
+
+        # Adjust weight for underrepresented collections
+        if "train_collection" in self.metadata.columns:
+            collection = self.metadata.iloc[idx]["train_collection"]
+            if collection == "iNat":  # If iNaturalist is underrepresented
+                weight *= 1.2
+
+        # Apply transforms if any
+        if self.transform:
+            spectrogram = self.transform(spectrogram)
+
+        return spectrogram, label, weight
+
+
+class MixupTransform:
+    """Mixup augmentation for spectrograms"""
+
+    def __init__(self, dataset, num_mix=3, alpha=0.2):
+        """
+        Args:
+            dataset: The dataset to sample from
+            num_mix: Maximum number of samples to mix
+            alpha: Parameter for beta distribution
+        """
+        self.dataset = dataset
+        self.num_mix = num_mix
+        self.alpha = alpha
+
+    def __call__(self, spectrogram, label):
+        """
+        Apply mixup to the spectrogram and label
+
+        Args:
+            spectrogram: Input spectrogram
+            label: One-hot encoded label
+
+        Returns:
+            Mixed spectrogram and label
+        """
+        # Determine number of samples to mix (1-3)
+        num_to_mix = np.random.randint(1, self.num_mix + 1)
+
+        # Start with the original sample
+        mixed_spec = spectrogram.clone()
+        mixed_label = label.clone()
+
+        # Mix with random samples
+        for _ in range(num_to_mix - 1):
+            # Sample random index
+            idx = np.random.randint(0, len(self.dataset))
+
+            # Get random sample
+            random_spec, random_label = self.dataset[idx]
+
+            # Sample mixing weight from beta distribution
+            lam = np.random.beta(self.alpha, self.alpha)
+
+            # Mix spectrogram and label
+            mixed_spec = lam * mixed_spec + (1 - lam) * random_spec
+            mixed_label = lam * mixed_label + (1 - lam) * random_label
+
+        return mixed_spec, mixed_label
+
+
+class BirdNETLightning(pl.LightningModule):
+    """PyTorch Lightning module for BirdNET"""
+
+    def __init__(
+        self,
+        num_classes,
+        learning_rate=1e-3,
+        width_factor=4,
+        depth_factor=3,
+        dropout_prob=0.5,
+        mixup=True,
+        dataset=None,
+    ):
+        super(BirdNETLightning, self).__init__()
+        self.save_hyperparameters()
+
+        # Model
+        self.model = WideResNet(
+            num_classes=num_classes,
+            width_factor=width_factor,
+            depth_factor=depth_factor,
+            dropout_prob=dropout_prob,
+        )
+
+        # Learning rate
+        self.learning_rate = learning_rate
+
+        # Mixup flag
+        self.mixup = mixup
+
+        # Binary cross-entropy loss for multi-label classification
+        self.criterion = nn.BCELoss()
+
+        # Dataset for mixup
+        self.dataset = dataset
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        # Unpack batch with metadata
+        spectrograms, labels, metadata = batch
+
+        # Apply adaptive mixup based on metadata
+        if self.mixup:
+            # For high-quality recordings (rating >= 4), use less aggressive mixup
+            high_quality_mask = metadata["train_rating"] >= 4
+
+            # Apply different mixup strategies based on quality
+            spectrograms_mixed = torch.zeros_like(spectrograms)
+            labels_mixed = torch.zeros_like(labels)
+
+            # High quality recordings get gentler mixup
+            spectrograms_mixed[high_quality_mask] = self.apply_mixup(
+                spectrograms[high_quality_mask],
+                labels[high_quality_mask],
+                alpha=0.2,  # Less aggressive
+            )
+
+            # Lower quality recordings get more aggressive mixup
+            spectrograms_mixed[~high_quality_mask] = self.apply_mixup(
+                spectrograms[~high_quality_mask],
+                labels[~high_quality_mask],
+                alpha=0.4,  # More aggressive
+            )
+
+            spectrograms = spectrograms_mixed
+            labels = labels_mixed
+
+        # Continue with forward pass and loss calculation
+        y_hat = self(spectrograms)
+        loss = self.criterion(y_hat, labels)
+
+        # Log training metrics
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y, _ = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+
+        # Calculate mAP (mean Average Precision)
+        y_np = y.cpu().numpy()
+        y_hat_np = y_hat.cpu().numpy()
+
+        # Handle case where a class has no positive samples in the batch
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ap_scores = [
+                average_precision_score(y_np[:, i], y_hat_np[:, i])
+                if np.sum(y_np[:, i]) > 0
+                else np.nan
+                for i in range(y_np.shape[1])
+            ]
+
+        # Filter out NaN values
+        ap_scores = [score for score in ap_scores if not np.isnan(score)]
+        mAP = np.mean(ap_scores) if ap_scores else 0.0
+
+        # Log validation metrics
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val_mAP", mAP, on_epoch=True, prog_bar=True)
+
+        return {"val_loss": loss, "val_mAP": mAP}
+
+    def test_step(self, batch, batch_idx):
+        x, y, _ = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+
+        # Calculate mAP
+        y_np = y.cpu().numpy()
+        y_hat_np = y_hat.cpu().numpy()
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ap_scores = [
+                average_precision_score(y_np[:, i], y_hat_np[:, i])
+                if np.sum(y_np[:, i]) > 0
+                else np.nan
+                for i in range(y_np.shape[1])
+            ]
+
+        ap_scores = [score for score in ap_scores if not np.isnan(score)]
+        mAP = np.mean(ap_scores) if ap_scores else 0.0
+
+        # Log test metrics
+        self.log("test_loss", loss, on_epoch=True)
+        self.log("test_mAP", mAP, on_epoch=True)
+
+        return {"test_loss": loss, "test_mAP": mAP}
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
+
+        # Learning rate scheduler with step-wise reduction
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,  # Reduce by half as mentioned in the paper
+            patience=3,
+            verbose=True,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+    def on_validation_epoch_end(self):
+        # Reduce dropout probability by 0.1 when learning rate is reduced
+        # This is mentioned in the paper
+        if hasattr(self, "last_lr") and self.last_lr != self.learning_rate:
+            # Learning rate was reduced
+            for module in self.modules():
+                if isinstance(module, nn.Dropout2d):
+                    module.p = max(0.0, module.p - 0.1)
+
+            self.last_lr = self.learning_rate
+        else:
+            self.last_lr = self.learning_rate
+
+        # Analyze performance by metadata categories
+        if hasattr(self, "val_metadata"):
+            # Group results by collection
+            collection_metrics = {}
+            for collection in self.val_metadata["train_collection"].unique():
+                mask = self.val_metadata["train_collection"] == collection
+                collection_preds = self.val_preds[mask]
+                collection_targets = self.val_targets[mask]
+
+                # Calculate mAP for this collection
+                collection_map = average_precision_score(
+                    collection_targets.cpu().numpy(), collection_preds.cpu().numpy()
+                )
+
+                collection_metrics[collection] = collection_map
+                self.log(f"val_mAP_{collection}", collection_map)
+
+            # Log geographic performance
+            # ... similar analysis by region ...
+
+
+def train_birdnet(
+    train_data_dir,
+    val_data_dir=None,
+    batch_size=32,
+    max_epochs=100,
+    learning_rate=1e-3,
+    width_factor=4,
+    depth_factor=3,
+    dropout_prob=0.5,
+    mixup=True,
+    num_workers=4,
+    checkpoint_dir="checkpoints",
+):
+    """
+    Train the BirdNET model
+
+    Args:
+        train_data_dir: Directory containing processed training data
+        val_data_dir: Directory containing processed validation data (if None, use train_data_dir)
+        batch_size: Batch size for training
+        max_epochs: Maximum number of epochs to train
+        learning_rate: Initial learning rate
+        width_factor: Width scaling factor for Wide ResNet (K)
+        depth_factor: Depth scaling factor for Wide ResNet (N)
+        dropout_prob: Initial dropout probability
+        mixup: Whether to use mixup augmentation
+        num_workers: Number of workers for data loading
+        checkpoint_dir: Directory to save checkpoints
+    """
+    # Create checkpoint directory
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Use validation directory if provided, otherwise use training directory
+    if val_data_dir is None:
+        val_data_dir = train_data_dir
+
+    # Create datasets
+    train_dataset = BirdSongDataset(
+        processed_dir=train_data_dir,
+        transform=None,  # Add transforms if needed
+        augment=True if mixup else False,
+    )
+
+    val_dataset = BirdSongDataset(
+        processed_dir=val_data_dir,
+        transform=None,
+        augment=False,  # No augmentation for validation
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # Get number of classes
+    num_classes = len(train_dataset.classes)
+    print(f"Training with {num_classes} classes")
+
+    # Create model
+    model = BirdNETLightning(
+        num_classes=num_classes,
+        learning_rate=learning_rate,
+        width_factor=width_factor,
+        depth_factor=depth_factor,
+        dropout_prob=dropout_prob,
+        mixup=mixup,
+        dataset=train_dataset if mixup else None,  # Pass dataset for mixup
+    )
+
+    # Callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename="birdnet-{epoch:02d}-{val_mAP:.4f}",
+        monitor="val_mAP",
+        mode="max",
+        save_top_k=3,
+    )
+
+    early_stopping = EarlyStopping(
+        monitor="val_loss",
+        patience=10,  # With cooldown of 3 as mentioned in the paper
+        mode="min",
+        min_delta=0.001,
+        verbose=True,
+    )
+
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
+    # Create trainer
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        callbacks=[checkpoint_callback, early_stopping, lr_monitor],
+        accelerator="auto",  # Use GPU if available
+        devices=1,
+        log_every_n_steps=10,
+    )
+
+    # Train model
+    trainer.fit(model, train_loader, val_loader)
+
+    # Return best model path
+    return checkpoint_callback.best_model_path
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train BirdNET model")
+    parser.add_argument(
+        "--train_dir",
+        type=str,
+        default="data/train_audio_processed",
+        help="Directory containing processed training data",
+    )
+    parser.add_argument(
+        "--val_dir",
+        type=str,
+        default=None,
+        help="Directory containing processed validation data (if None, use train_dir)",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=32, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--max_epochs", type=int, default=100, help="Maximum number of epochs to train"
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=1e-3, help="Initial learning rate"
+    )
+    parser.add_argument(
+        "--width_factor",
+        type=int,
+        default=4,
+        help="Width scaling factor for Wide ResNet (K)",
+    )
+    parser.add_argument(
+        "--depth_factor",
+        type=int,
+        default=3,
+        help="Depth scaling factor for Wide ResNet (N)",
+    )
+    parser.add_argument(
+        "--dropout_prob", type=float, default=0.5, help="Initial dropout probability"
+    )
+    parser.add_argument(
+        "--no_mixup", action="store_true", help="Disable mixup augmentation"
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=4, help="Number of workers for data loading"
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints",
+    )
+
+    args = parser.parse_args()
+
+    # Train model
+    best_model_path = train_birdnet(
+        train_data_dir=args.train_dir,
+        val_data_dir=args.val_dir,
+        batch_size=args.batch_size,
+        max_epochs=args.max_epochs,
+        learning_rate=args.learning_rate,
+        width_factor=args.width_factor,
+        depth_factor=args.depth_factor,
+        dropout_prob=args.dropout_prob,
+        mixup=not args.no_mixup,
+        num_workers=args.num_workers,
+        checkpoint_dir=args.checkpoint_dir,
+    )
+
+    print(f"Best model saved at: {best_model_path}")
