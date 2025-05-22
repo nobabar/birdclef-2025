@@ -1,0 +1,82 @@
+[project]
+name = "birdclef-2025"
+version = "0.1.0"
+description = "BirdCLEF 2025"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name="Baptiste Rousseau", email="bapt09.rousseau@gmail.com" },
+    { name="Imane Messak", email="messak.imane@gmail.com" },
+]
+dependencies = [
+    "jupyterlab>=4.4.2",
+    "numpy>=2.2.6",
+    "pandas>=2.2.3",
+    "pytorch-lightning>=2.5.1.post0",
+    "scikit-learn>=1.6.1",
+    "scipy>=1.15.3",
+    "torch>=2.7.0",
+    "torchaudio>=2.7.0",
+    "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.10",
+]
+
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    "env",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+]
+
+# Same as Black.
+line-length = 88
+indent-width = 4
+
+# Assume Python 3.10
+target-version = "py310"
+
+[tool.ruff.lint]
+# ruff rules doc: https://docs.astral.sh/ruff/rules
+select = ["S", "R", "RET", "Q", "F", "I", "N", "E", "W", "D", "COM", "LOG", "G", "T20", "PYI", "PT"]
+ignore = ["E501", "N818", "D100", "D104", "PT009", "PT027", "D212", "D203", "S105", "COM812", "D417"]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
