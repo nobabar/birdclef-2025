@@ -64,22 +64,24 @@ create a uv environment
 uv venv
 ```
 
-install the necessary packages from the `pyproject.toml`
-
-```
-uv pip install -r pyproject.toml
-```
-
 then activate it
 
 ```
 source .venv/bin/activate
 ```
 
-and finally run the script
+install the necessary packages from the `pyproject.toml`
+
+```
+uv pip install -r pyproject.toml
+```
+
+and finally run the scripts
 
 ```
 python preprocessing.py
+python augmentation.py
+python training.py
 ```
 
 ## References
