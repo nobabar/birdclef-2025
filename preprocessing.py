@@ -12,7 +12,10 @@ from tqdm import tqdm
 
 
 class BirdSongPreprocessor:
+    """Preprocess bird song audio files into mel spectrograms."""
+
     def __init__(self):
+        """Initialize the BirdSongPreprocessor."""
         # Key parameters from the paper:
         self.sample_rate = 32000  # Competition data is 32kHz
         self.n_fft = 1024  # FFT window size (~32ms at 32kHz)
@@ -40,8 +43,9 @@ class BirdSongPreprocessor:
         self, waveform, threshold_factor=3.5, noise_threshold_factor=2.0
     ):
         """
-        Extract segments containing bird vocalizations based on signal strength
-        Implementation based on Sprengel et al., 2016 approach
+        Extract segments containing bird vocalizations based on signal strength.
+
+        Implementation based on Sprengel et al., 2016 approach.
 
         Args:
             waveform: Input audio waveform
@@ -51,6 +55,7 @@ class BirdSongPreprocessor:
         Returns:
             signal_mask: Boolean mask indicating signal segments
             noise_mask: Boolean mask indicating noise segments
+
         """
         # Convert to spectrogram without log scaling for signal detection
         spec = self.mel_spectrogram(waveform)
@@ -133,7 +138,7 @@ class BirdSongPreprocessor:
 
     def separate_signal_noise(self, waveform):
         """
-        Separate audio into signal (bird vocalization) and noise parts
+        Separate audio into signal (bird vocalization) and noise parts.
 
         Args:
             waveform: Input audio waveform
@@ -141,6 +146,7 @@ class BirdSongPreprocessor:
         Returns:
             signal_waveform: Audio containing only bird vocalizations
             noise_waveform: Audio containing only background noise
+
         """
         # Get signal and noise masks
         signal_mask, noise_mask = self.extract_signal_segments(waveform)
@@ -157,6 +163,8 @@ class BirdSongPreprocessor:
 
     def process_audio(self, audio_path, chunk_duration=3.0, overlap=0.5):
         """
+        Process audio file into mel spectrograms.
+
         Process audio file into mel spectrograms, cutting into equal-sized chunks as
         described in Sprengel et al., using 3-second chunks as recommended in Kahl et al.
 
@@ -168,6 +176,7 @@ class BirdSongPreprocessor:
         Returns:
             signal_chunks: List of mel spectrograms containing bird vocalizations
             noise_chunks: List of mel spectrograms containing background noise
+
         """
         # Load audio
         waveform, sr = torchaudio.load(audio_path)
@@ -249,6 +258,7 @@ def prepare_batch(
         metadata_path (str): Path to the train.csv file with additional metadata
         save_dir (str): Directory to save the processed audio files
         show_progress (bool): Whether to show progress bars
+
     """
     # Create save_dir if it doesn't exist
     save_dir = Path("data", save_dir)

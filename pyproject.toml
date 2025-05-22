@@ -59,7 +59,7 @@ target-version = "py310"
 [tool.ruff.lint]
 # ruff rules doc: https://docs.astral.sh/ruff/rules
 select = ["S", "R", "RET", "Q", "F", "I", "N", "E", "W", "D", "COM", "LOG", "G", "T20", "PYI", "PT"]
-ignore = ["E501", "N818", "D100", "D104", "PT009", "PT027", "D212", "D203", "S105", "COM812", "D417"]
+ignore = ["E501", "N818", "D100", "D104", "PT009", "PT027", "D212", "D203", "S105", "COM812", "D417", "T201", "N812", "RET504", "N806"]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]

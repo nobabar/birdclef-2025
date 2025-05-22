@@ -18,9 +18,10 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class BasicBlock(nn.Module):
-    """Basic residual block for ResNet"""
+    """Basic residual block for ResNet."""
 
     def __init__(self, in_channels, out_channels, stride=1, dropout_prob=0.5):
+        """Initialize the basic residual block."""
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(
             in_channels,
@@ -48,6 +49,7 @@ class BasicBlock(nn.Module):
             )
 
     def forward(self, x):
+        """Forward pass for the basic block."""
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.dropout(out)
         out = self.bn2(self.conv2(out))
@@ -57,9 +59,10 @@ class BasicBlock(nn.Module):
 
 
 class DownsamplingBlock(nn.Module):
-    """Downsampling residual block with strided convolution"""
+    """Downsampling residual block with strided convolution."""
 
     def __init__(self, in_channels, out_channels, dropout_prob=0.5):
+        """Initialize the downsampling block."""
         super(DownsamplingBlock, self).__init__()
         # As per Xie et al., 2018 suggestion for downsampling blocks
         self.conv1 = nn.Conv2d(
@@ -79,6 +82,7 @@ class DownsamplingBlock(nn.Module):
         )
 
     def forward(self, x):
+        """Forward pass for the downsampling block."""
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.dropout(out)
         out = self.bn2(self.conv2(out))
@@ -88,9 +92,10 @@ class DownsamplingBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
-    """Wide ResNet implementation based on BirdNET paper"""
+    """Wide ResNet implementation based on BirdNET paper."""
 
     def __init__(self, num_classes, width_factor=4, depth_factor=3, dropout_prob=0.5):
+        """Initialize the Wide ResNet model."""
         super(WideResNet, self).__init__()
 
         # Initial number of channels (scaled by width factor K)
@@ -159,6 +164,7 @@ class WideResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        """Forward pass for the Wide ResNet model."""
         # Input shape: [batch_size, 1, 64, 384] (mel spectrogram)
 
         # Pre-processing
@@ -186,14 +192,17 @@ class WideResNet(nn.Module):
 
 
 class BirdSongDataset(Dataset):
-    """Dataset for loading processed bird song spectrograms"""
+    """Dataset for loading processed bird song spectrograms."""
 
     def __init__(self, processed_dir, transform=None, augment=False):
         """
+        Initialize the dataset.
+
         Args:
             processed_dir: Directory with all the processed spectrograms and metadata
             transform: Optional transform to be applied on a sample
             augment: Whether to use augmented samples
+
         """
         self.processed_dir = Path(processed_dir)
         self.transform = transform
@@ -215,9 +224,11 @@ class BirdSongDataset(Dataset):
         )
 
     def __len__(self):
+        """Get the length of the dataset."""
         return len(self.metadata)
 
     def __getitem__(self, idx):
+        """Get an item from the dataset."""
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
@@ -265,14 +276,17 @@ class BirdSongDataset(Dataset):
 
 
 class MixupTransform:
-    """Mixup augmentation for spectrograms"""
+    """Mixup augmentation for spectrograms."""
 
     def __init__(self, dataset, num_mix=3, alpha=0.2):
         """
+        Initialize the MixupTransform.
+
         Args:
             dataset: The dataset to sample from
             num_mix: Maximum number of samples to mix
             alpha: Parameter for beta distribution
+
         """
         self.dataset = dataset
         self.num_mix = num_mix
@@ -280,7 +294,7 @@ class MixupTransform:
 
     def __call__(self, spectrogram, label):
         """
-        Apply mixup to the spectrogram and label
+        Apply mixup to the spectrogram and label.
 
         Args:
             spectrogram: Input spectrogram
@@ -288,6 +302,7 @@ class MixupTransform:
 
         Returns:
             Mixed spectrogram and label
+
         """
         # Determine number of samples to mix (1-3)
         num_to_mix = np.random.randint(1, self.num_mix + 1)
@@ -315,7 +330,7 @@ class MixupTransform:
 
 
 class BirdNETLightning(pl.LightningModule):
-    """PyTorch Lightning module for BirdNET"""
+    """PyTorch Lightning module for BirdNET."""
 
     def __init__(
         self,
@@ -327,6 +342,7 @@ class BirdNETLightning(pl.LightningModule):
         mixup=True,
         dataset=None,
     ):
+        """Initialize the BirdNETLightning module."""
         super(BirdNETLightning, self).__init__()
         self.save_hyperparameters()
 
@@ -351,9 +367,11 @@ class BirdNETLightning(pl.LightningModule):
         self.dataset = dataset
 
     def forward(self, x):
+        """Forward pass for the BirdNETLightning module."""
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
+        """Training step for the BirdNETLightning module."""
         # Unpack batch with metadata
         spectrograms, labels, metadata = batch
 
@@ -393,6 +411,7 @@ class BirdNETLightning(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
+        """Perform validation step for the BirdNETLightning module."""
         x, y, _ = batch
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
@@ -421,6 +440,7 @@ class BirdNETLightning(pl.LightningModule):
         return {"val_loss": loss, "val_mAP": mAP}
 
     def test_step(self, batch, batch_idx):
+        """Test step for the BirdNETLightning module."""
         x, y, _ = batch
         y_hat = self(x)
         loss = self.criterion(y_hat, y)
@@ -447,6 +467,7 @@ class BirdNETLightning(pl.LightningModule):
         return {"test_loss": loss, "test_mAP": mAP}
 
     def configure_optimizers(self):
+        """Configure the optimizers for the BirdNETLightning module."""
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
 
         # Learning rate scheduler with step-wise reduction
@@ -469,6 +490,7 @@ class BirdNETLightning(pl.LightningModule):
         }
 
     def on_validation_epoch_end(self):
+        """Analyze performance by metadata categories."""
         # Reduce dropout probability by 0.1 when learning rate is reduced
         # This is mentioned in the paper
         if hasattr(self, "last_lr") and self.last_lr != self.learning_rate:
@@ -516,7 +538,7 @@ def train_birdnet(
     checkpoint_dir="checkpoints",
 ):
     """
-    Train the BirdNET model
+    Train the BirdNET model.
 
     Args:
         train_data_dir: Directory containing processed training data
@@ -530,6 +552,7 @@ def train_birdnet(
         mixup: Whether to use mixup augmentation
         num_workers: Number of workers for data loading
         checkpoint_dir: Directory to save checkpoints
+
     """
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)

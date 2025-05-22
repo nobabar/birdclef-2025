@@ -8,10 +8,10 @@ from tqdm import tqdm
 
 
 class BirdSongAugmenter:
+    """Augmenter for bird song spectrograms."""
+
     def __init__(self, seed=42):
-        """
-        Initialize the augmenter with optional random seed for reproducibility
-        """
+        """Initialize the augmenter with optional random seed for reproducibility."""
         self.seed = seed
         np.random.seed(seed)
         random.seed(seed)
@@ -19,7 +19,7 @@ class BirdSongAugmenter:
 
     def frequency_shift(self, spec, max_shift_pct=0.1):
         """
-        Apply frequency shift augmentation
+        Apply frequency shift augmentation.
 
         Args:
             spec: Input spectrogram (1, freq_bins, time_bins)
@@ -27,6 +27,7 @@ class BirdSongAugmenter:
 
         Returns:
             Augmented spectrogram
+
         """
         _, freq_bins, _ = spec.shape
         max_shift = int(freq_bins * max_shift_pct)
@@ -54,7 +55,7 @@ class BirdSongAugmenter:
 
     def time_shift(self, spec, max_shift_pct=0.2):
         """
-        Apply time shift augmentation
+        Apply time shift augmentation.
 
         Args:
             spec: Input spectrogram (1, freq_bins, time_bins)
@@ -62,6 +63,7 @@ class BirdSongAugmenter:
 
         Returns:
             Augmented spectrogram
+
         """
         _, _, time_bins = spec.shape
         max_shift = int(time_bins * max_shift_pct)
@@ -89,8 +91,10 @@ class BirdSongAugmenter:
 
     def spec_warp(self, spec):
         """
-        Spectrogram warping similar to SpecAugment
-        Applies random partial stretching in time and frequency
+        Spectrogram warping similar to SpecAugment.
+
+        Applies random partial stretching in time and frequency.
+
         """
         freq_dim, time_dim = spec.shape[1:]
 
@@ -112,7 +116,7 @@ class BirdSongAugmenter:
 
     def add_noise(self, spec, noise_specs, max_weight=0.5):
         """
-        Add random noise from a collection of noise spectrograms
+        Add random noise from a collection of noise spectrograms.
 
         Args:
             spec: Input spectrogram
@@ -121,6 +125,7 @@ class BirdSongAugmenter:
 
         Returns:
             Augmented spectrogram
+
         """
         if not noise_specs:
             return spec
@@ -176,10 +181,10 @@ def augment_dataset(
     show_progress=True,
 ):
     """
-    Augment a dataset of processed spectrograms
+    Augment a dataset of processed spectrograms.
 
-    For each original spectrogram, create multiple augmented versions
-    Each augmented version can have up to 3 different augmentation techniques applied
+    For each original spectrogram, create multiple augmented versions.
+    Each augmented version can have up to 3 different augmentation techniques applied.
 
     Args:
         processed_dir: Directory containing processed spectrograms
@@ -190,6 +195,7 @@ def augment_dataset(
         spec_warp_prob: Probability of applying spectrogram warping to each augmented version
         noise_prob: Probability of applying noise addition to each augmented version
         show_progress: Whether to show progress bars
+
     """
     # Create output directory
     if output_dir is None:
