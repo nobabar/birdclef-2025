@@ -597,6 +597,8 @@ class BirdNETLightning(pl.LightningModule):
 def train_birdnet(
     train_data_dir,
     val_data_dir=None,
+    val_split=0.1,
+    test_split=0.0,
     batch_size=32,
     max_epochs=100,
     learning_rate=1e-3,
@@ -613,6 +615,8 @@ def train_birdnet(
     Args:
         train_data_dir: Directory containing processed training data
         val_data_dir: Directory containing processed validation data (if None, use train_data_dir)
+        val_split: Fraction of data to use for validation (0.0 to 1.0)
+        test_split: Fraction of data to use for testing (0.0 to 1.0)
         batch_size: Batch size for training
         max_epochs: Maximum number of epochs to train
         learning_rate: Initial learning rate
@@ -627,22 +631,43 @@ def train_birdnet(
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Use validation directory if provided, otherwise use training directory
-    if val_data_dir is None:
-        val_data_dir = train_data_dir
-
-    # Create datasets
-    train_dataset = BirdSongDataset(
+    # Load the full dataset
+    full_dataset = BirdSongDataset(
         processed_dir=train_data_dir,
-        transform=None,  # Add transforms if needed
-        augment=True if mixup else False,
+        transform=None,
+        augment=False,
     )
 
-    val_dataset = BirdSongDataset(
-        processed_dir=val_data_dir,
-        transform=None,
-        augment=False,  # No augmentation for validation
+    # If validation directory is provided, use it and set val_split to 0.0
+    if val_data_dir:
+        val_dataset = BirdSongDataset(
+            processed_dir=val_data_dir,
+            transform=None,
+            augment=False,
+        )
+        val_split = 0.0
+
+    # Create datasets based on split configuration
+    # Calculate split sizes
+    dataset_size = len(full_dataset)
+    test_size = int(dataset_size * test_split)
+    val_size = int(dataset_size * val_split)
+    train_size = dataset_size - test_size - val_size
+
+    # Create random splits
+    generator = torch.Generator().manual_seed(42)  # For reproducibility
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size, test_size], generator=generator
     )
+
+    print(
+        f"Dataset split: {train_size} train ({train_size/dataset_size:.1%}), "
+        f"{val_size} validation ({val_size/dataset_size:.1%}), "
+        f"{test_size} test ({test_size/dataset_size:.1%})"
+    )
+
+    # Set augmentation for training set
+    train_dataset.dataset.augment = mixup
 
     # Create data loaders
     train_loader = DataLoader(
@@ -654,17 +679,32 @@ def train_birdnet(
         pin_memory=torch.cuda.is_available(),
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        persistent_workers=True if num_workers > 0 else False,
-        pin_memory=torch.cuda.is_available(),
-    )
+    # Create validation loader if validation data exists
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    # Create test loader if test data exists
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=torch.cuda.is_available(),
+        )
 
     # Get number of classes
-    num_classes = len(train_dataset.classes)
+    num_classes = len(full_dataset.classes)
     print(f"Training with {num_classes} classes")
 
     # Create model
@@ -675,7 +715,7 @@ def train_birdnet(
         depth_factor=depth_factor,
         dropout_prob=dropout_prob,
         mixup=mixup,
-        dataset=train_dataset if mixup else None,  # Pass dataset for mixup
+        dataset=train_dataset if mixup else None,
     )
 
     # Callbacks
@@ -709,6 +749,12 @@ def train_birdnet(
     # Train model
     trainer.fit(model, train_loader, val_loader)
 
+    # Test model if test data exists
+    if test_loader:
+        print("\nEvaluating model on test set...")
+        test_results = trainer.test(model, test_loader, verbose=True)
+        print(f"Test results: {test_results}")
+
     # Return best model path
     return checkpoint_callback.best_model_path
 
@@ -728,6 +774,18 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Directory containing processed validation data (if None, use train_dir)",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.1,  # Default to 10% test split
+        help="Fraction of data to use for validation (0.0 to 1.0, default: 0.1 for 80/10/10 split)",
+    )
+    parser.add_argument(
+        "--test_split",
+        type=float,
+        default=0.1,  # Default to 10% test split
+        help="Fraction of data to use for testing (0.0 to 1.0, default: 0.1 for 80/10/10 split)",
     )
     parser.add_argument(
         "--batch_size", type=int, default=32, help="Batch size for training"
@@ -772,6 +830,8 @@ if __name__ == "__main__":
     best_model_path = train_birdnet(
         train_data_dir=args.train_dir,
         val_data_dir=args.val_dir,
+        val_split=args.val_split,
+        test_split=args.test_split,
         batch_size=args.batch_size,
         max_epochs=args.max_epochs,
         learning_rate=args.learning_rate,
