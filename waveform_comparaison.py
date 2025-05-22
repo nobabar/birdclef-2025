@@ -78,3 +78,22 @@ def visualize_waveform_in_seconds(original, cleaned, sample_rate):
     plt.ylabel("Amplitude")
     plt.tight_layout()
     plt.show()
+
+
+def normalize_waveform(waveform):
+    """
+    Normalize the waveform to have values between -1 and 1.
+
+    This is useful for ensuring that the waveform is within a standard range,
+    especially before saving or processing.
+
+    Args:
+    ----
+        waveform (torch.Tensor): The input waveform tensor of shape [channels, num_samples].
+
+    Returns:
+    -------
+        torch.Tensor: The normalized waveform tensor of the same shape.
+    """
+    max_val = waveform.abs().max()
+    return waveform / (max_val + 1e-9) if max_val > 0 else waveform

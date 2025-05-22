@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from waveform_comparaison import (
     compare_energy,
-    visualize_waveform,
     visualize_waveform_in_seconds,
 )
 
@@ -245,12 +244,17 @@ class BirdSongPreprocessor:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
         # Remove human voice
-        original = waveform
+        original_waveform = waveform
         waveform = self.remove_human_voice_using_silero(waveform)
-        # visualize the waveform before and after voice removal
-        compare_energy(original, waveform)
-        visualize_waveform(original, waveform)
-        visualize_waveform_in_seconds(original, waveform, sr)
+
+        # Compare energy before and after voice removal
+        compare_energy(original_waveform, waveform)
+
+        ######
+        # Visualize the waveform
+        ######
+        # visualize the waveform in seconds
+        visualize_waveform_in_seconds(original_waveform, waveform, sr)
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)
@@ -384,7 +388,7 @@ def prepare_batch(
             existing_signal_files = glob.glob(signal_pattern)
 
             # Get filename for metadata lookup
-            rel_path = os.path.relpath(audio_file, "data/train_audio")
+            rel_path = os.path.relpath(audio_file, "data/train_audio_data")
             filename = rel_path.replace("\\", "/")  # Normalize path separators
             additional_meta = train_metadata.get(filename, {})
 
@@ -512,7 +516,6 @@ def prepare_batch(
 
 
 if __name__ == "__main__":
-    # Example usage
     import argparse
 
     parser = argparse.ArgumentParser(description="Preprocess bird audio files")
@@ -520,7 +523,7 @@ if __name__ == "__main__":
         "--input_dir",
         "-I",
         type=str,
-        default="data/train_audio",
+        default="data/train_audio_test",
         help="Directory containing audio files",
     )
     parser.add_argument(
