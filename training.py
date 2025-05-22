@@ -238,27 +238,29 @@ class BirdSongDataset(Dataset):
         # Load spectrogram
         try:
             spectrogram = torch.load(file_path)
+            # Ensure spectrogram is float32
+            spectrogram = spectrogram.float()
         except FileNotFoundError:
             # If the path in metadata is relative, try to resolve it
             file_path = self.processed_dir / file_path
-            spectrogram = torch.load(file_path)
+            spectrogram = torch.load(file_path).float()
 
         # Get label (folder name is the class)
         folder = self.metadata.iloc[idx]["folder"]
         label_idx = self.class_to_idx[folder]
 
-        # Convert to one-hot encoding
-        label = torch.zeros(len(self.classes))
+        # Convert to one-hot encoding (ensure float32)
+        label = torch.zeros(len(self.classes), dtype=torch.float32)
         label[label_idx] = 1.0
 
         # Get sample weight based on metadata
-        weight = 1.0
+        weight = torch.tensor(1.0, dtype=torch.float32)
 
         # Adjust weight based on recording quality
         if "train_rating" in self.metadata.columns and not pd.isna(
             self.metadata.iloc[idx]["train_rating"]
         ):
-            rating = self.metadata.iloc[idx]["train_rating"]
+            rating = float(self.metadata.iloc[idx]["train_rating"])
             # Higher rated recordings get higher weights
             weight *= 1.0 + rating / 5.0
 
@@ -474,9 +476,9 @@ class BirdNETLightning(pl.LightningModule):
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=0.5,  # Reduce by half as mentioned in the paper
-            patience=3,
-            verbose=True,
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
         )
 
         return {
@@ -485,7 +487,6 @@ class BirdNETLightning(pl.LightningModule):
                 "scheduler": scheduler,
                 "monitor": "val_loss",
                 "interval": "epoch",
-                "frequency": 1,
             },
         }
 
@@ -580,7 +581,8 @@ def train_birdnet(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        pin_memory=torch.cuda.is_available(),
     )
 
     val_loader = DataLoader(
@@ -588,7 +590,8 @@ def train_birdnet(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        pin_memory=torch.cuda.is_available(),
     )
 
     # Get number of classes
