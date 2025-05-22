@@ -375,30 +375,53 @@ class BirdNETLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Training step for the BirdNETLightning module."""
         # Unpack batch with metadata
-        spectrograms, labels, metadata = batch
+        spectrograms, labels, weights = batch
 
         # Apply adaptive mixup based on metadata
         if self.mixup:
-            # For high-quality recordings (rating >= 4), use less aggressive mixup
-            high_quality_mask = metadata["train_rating"] >= 4
+            # Create a default mask (all False)
+            batch_size = spectrograms.shape[0]
+            high_quality_mask = torch.zeros(
+                batch_size, dtype=torch.bool, device=spectrograms.device
+            )
+
+            # If weights > 1.8, consider it high quality (rating >= 4 would give weight >= 1.8)
+            # This is based on the weight calculation: weight *= 1.0 + rating / 5.0
+            high_quality_mask = weights > 1.8
 
             # Apply different mixup strategies based on quality
             spectrograms_mixed = torch.zeros_like(spectrograms)
             labels_mixed = torch.zeros_like(labels)
 
-            # High quality recordings get gentler mixup
-            spectrograms_mixed[high_quality_mask] = self.apply_mixup(
-                spectrograms[high_quality_mask],
-                labels[high_quality_mask],
-                alpha=0.2,  # Less aggressive
-            )
+            # Process high quality recordings if any exist
+            if high_quality_mask.any():
+                # High quality recordings get gentler mixup
+                high_quality_specs = spectrograms[high_quality_mask]
+                high_quality_labels = labels[high_quality_mask]
 
-            # Lower quality recordings get more aggressive mixup
-            spectrograms_mixed[~high_quality_mask] = self.apply_mixup(
-                spectrograms[~high_quality_mask],
-                labels[~high_quality_mask],
-                alpha=0.4,  # More aggressive
-            )
+                # Apply mixup with lower alpha (less aggressive)
+                mixed_specs, mixed_labels = self.apply_mixup(
+                    high_quality_specs,
+                    high_quality_labels,
+                    alpha=0.2,  # Less aggressive
+                )
+                spectrograms_mixed[high_quality_mask] = mixed_specs
+                labels_mixed[high_quality_mask] = mixed_labels
+
+            # Process lower quality recordings if any exist
+            if (~high_quality_mask).any():
+                # Lower quality recordings get more aggressive mixup
+                low_quality_specs = spectrograms[~high_quality_mask]
+                low_quality_labels = labels[~high_quality_mask]
+
+                # Apply mixup with higher alpha (more aggressive)
+                mixed_specs, mixed_labels = self.apply_mixup(
+                    low_quality_specs,
+                    low_quality_labels,
+                    alpha=0.4,  # More aggressive
+                )
+                spectrograms_mixed[~high_quality_mask] = mixed_specs
+                labels_mixed[~high_quality_mask] = mixed_labels
 
             spectrograms = spectrograms_mixed
             labels = labels_mixed
