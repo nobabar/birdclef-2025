@@ -9,7 +9,8 @@ import torchaudio
 import torchaudio.transforms as AT
 from scipy import ndimage
 from tqdm import tqdm
-
+from silero_vad import get_speech_timestamps, load_silero_vad
+# from torchaudio.pipelines import WAV2VEC2_ASR_BASE_960H
 
 class BirdSongPreprocessor:
     """Preprocess bird song audio files into mel spectrograms."""
@@ -38,6 +39,10 @@ class BirdSongPreprocessor:
             normalized=True,
             norm="slaney",  # Slaney-style mel normalization
         )
+        # Optional: Load speech model for voice detection
+        # self.vad_model = torchaudio.pipelines.SUPERB_VAD.get_model()
+        self.vad_model = load_silero_vad()
+
 
     def extract_signal_segments(
         self, waveform, threshold_factor=3.5, noise_threshold_factor=2.0
@@ -160,6 +165,62 @@ class BirdSongPreprocessor:
         noise_waveform[:, noise_mask] = waveform[:, noise_mask]
 
         return signal_waveform, noise_waveform
+    
+    # def remove_human_voice_using_wav2vec2(self, waveform):
+    #     """
+    #     Removes human voice segments using a pretrained VAD model.
+
+    #     Args:
+    #         waveform (Tensor): [1, T] tensor of audio samples.
+
+    #     Returns:
+    #         waveform_without_voice (Tensor): Audio with voice segments zeroed out.
+    #     """
+    #     with torch.inference_mode():
+    #         # Normalize waveform for VAD
+    #         input_values = waveform / (waveform.abs().max() + 1e-9)
+
+    #         # Perform VAD
+    #         vad_result = self.vad_model(input_values)
+
+    #         # vad_result is (T,) with values in [0, 1], threshold at 0.5
+    #         voice_mask = vad_result[0] > 0.5
+
+    #         # Create inverse mask and apply
+    #         voice_removed_waveform = waveform.clone()
+    #         voice_removed_waveform[:, voice_mask] = 0
+
+    #     return voice_removed_waveform
+    def remove_human_voice_using_silero(self, waveform):
+        """
+        Removes segments of waveform where human voice is detected using Silero VAD.
+        Args:
+            waveform: Tensor of shape (1, N)
+        Returns:
+            waveform with human voice segments zeroed out
+        """
+        # Silero VAD expects 16kHz mono audio
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        if self.sample_rate != 16000:
+            resampler = AT.Resample(orig_freq=self.sample_rate, new_freq=16000)
+            waveform_16k = resampler(waveform)
+        else:
+            waveform_16k = waveform.clone()
+
+        # Detect voice segments
+        speech_timestamps = get_speech_timestamps(waveform_16k[0], self.vad_model, sampling_rate=16000)
+
+        # Map detected speech timestamps back to original sample rate
+        waveform_clean = waveform.clone()
+        for segment in speech_timestamps:
+            start = int(segment['start'] * self.sample_rate / 16000)
+            end = int(segment['end'] * self.sample_rate / 16000)
+            waveform_clean[:, start:end] = 0  # zero out human voice
+
+        return waveform_clean
+
 
     def process_audio(self, audio_path, chunk_duration=3.0, overlap=0.5):
         """
@@ -189,6 +250,10 @@ class BirdSongPreprocessor:
         # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Remove human voice
+        waveform = self.remove_human_voice_using_silero(waveform)
+        # waveform = self.remove_human_voice_using_wav2vec2(waveform)
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)

@@ -1,12 +1,15 @@
 # BirdCLEF 2025: Bird Song Classification
 
 ## Project Overview
+
 This project focuses on the BirdCLEF 2025 competition, a machine learning challenge for bird song classification. The goal is to develop algorithms that can identify bird species from audio recordings, with applications in biodiversity monitoring and ecological research.
 
 ## Data Structure
+
 The dataset consists of several components:
 
 ### Training Data
+
 - **train_audio/**: Individual bird sound recordings
   - Clean, single-species recordings
   - Labeled with species information
@@ -19,6 +22,7 @@ The dataset consists of several components:
   - Filenames: `[site]_[date]_[local_time].ogg`
 
 ### Metadata Files
+
 - **train.csv**: Contains metadata for training recordings
   - `primary_label`: Species code
   - `secondary_labels`: Additional species in recording
@@ -32,6 +36,7 @@ The dataset consists of several components:
   - Class name (Aves, Amphibia, Mammalia, Insecta)
 
 ## Audio Processing Pipeline
+
 Our preprocessing pipeline follows the BirdNET paper approach:
 
 1. **Spectrogram Generation**
@@ -51,9 +56,39 @@ Our preprocessing pipeline follows the BirdNET paper approach:
    - Signal strength-based detection
    - Log scaling for magnitude
 
+## To test the project
+
+create a uv environment
+
+```
+uv venv
+```
+
+install the necessary packages from the `pyproject.toml`
+
+```
+uv pip install -r pyproject.toml
+```
+
+then activate it
+
+```
+source .venv/bin/activate
+```
+
+and finally run the script
+
+```
+python preprocessing.py
+```
+
 ## References
+
 - [BirdNET Paper](https://www.sciencedirect.com/science/article/pii/S1574954121000273)
 - [BirdCLEF 2025 Competition](https://www.kaggle.com/competitions/birdclef-2025)
 
 ## License
-MIT
+
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/license/mit)
+
+Licensed under a [MIT License](https://opensource.org/license/mit).
