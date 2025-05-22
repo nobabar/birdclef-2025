@@ -547,6 +547,52 @@ class BirdNETLightning(pl.LightningModule):
             # Log geographic performance
             # ... similar analysis by region ...
 
+    def apply_mixup(self, spectrograms, labels, alpha=0.2):
+        """
+        Apply mixup augmentation to a batch of spectrograms and labels.
+
+        Args:
+            spectrograms: Batch of spectrograms [batch_size, channels, height, width]
+            labels: Batch of one-hot encoded labels [batch_size, num_classes]
+            alpha: Parameter for beta distribution (lower = less aggressive mixing)
+
+        Returns:
+            mixed_spectrograms: Mixed batch of spectrograms
+            mixed_labels: Mixed batch of labels
+
+        """
+        batch_size = spectrograms.shape[0]
+
+        # If batch size is 1, can't mix
+        if batch_size <= 1:
+            return spectrograms, labels
+
+        # Sample mixing weights from beta distribution
+        weights = (
+            torch.from_numpy(np.random.beta(alpha, alpha, size=batch_size))
+            .float()
+            .to(spectrograms.device)
+        )
+
+        # Expand weights for broadcasting
+        weights = weights.view(-1, 1, 1, 1)
+
+        # Create random permutation of the batch
+        indices = torch.randperm(batch_size).to(spectrograms.device)
+
+        # Mix spectrograms
+        mixed_spectrograms = (
+            weights * spectrograms + (1 - weights) * spectrograms[indices]
+        )
+
+        # Adjust weights for labels (remove extra dimensions)
+        label_weights = weights.view(-1, 1)
+
+        # Mix labels
+        mixed_labels = label_weights * labels + (1 - label_weights) * labels[indices]
+
+        return mixed_spectrograms, mixed_labels
+
 
 def train_birdnet(
     train_data_dir,
@@ -657,7 +703,7 @@ def train_birdnet(
         callbacks=[checkpoint_callback, early_stopping, lr_monitor],
         accelerator="auto",  # Use GPU if available
         devices=1,
-        log_every_n_steps=10,
+        log_every_n_steps=1,
     )
 
     # Train model
