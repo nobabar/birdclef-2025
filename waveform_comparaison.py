@@ -1,3 +1,5 @@
+import os
+
 import matplotlib.pyplot as plt
 import torch
 
@@ -48,7 +50,7 @@ def visualize_waveform(original, cleaned):
     plt.show()
 
 
-def visualize_waveform_in_seconds(original, cleaned, sample_rate):
+def visualize_waveform_in_seconds(original, cleaned, sample_rate, save_path=None):
     """
     Visualize the waveform of audio signals before and after processing, with time represented in seconds.
 
@@ -76,8 +78,14 @@ def visualize_waveform_in_seconds(original, cleaned, sample_rate):
     plt.title("Waveform Before and After Voice Removal")
     plt.xlabel("Time (seconds)")
     plt.ylabel("Amplitude")
+    plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
 
 
 def normalize_waveform(waveform):

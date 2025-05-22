@@ -46,8 +46,6 @@ class BirdSongPreprocessor:
             normalized=True,
             norm="slaney",  # Slaney-style mel normalization
         )
-        # Optional: Load speech model for voice detection
-        # self.vad_model = torchaudio.pipelines.SUPERB_VAD.get_model()
         self.vad_model = load_silero_vad()
 
     def extract_signal_segments(
@@ -212,7 +210,9 @@ class BirdSongPreprocessor:
 
         return waveform_clean
 
-    def process_audio(self, audio_path, chunk_duration=3.0, overlap=0.5):
+    def process_audio(
+        self, audio_path, chunk_duration=3.0, overlap=0.5, visualization_dir=None
+    ):
         """
         Process audio file into mel spectrograms.
 
@@ -253,8 +253,17 @@ class BirdSongPreprocessor:
         ######
         # Visualize the waveform
         ######
-        # visualize the waveform in seconds
-        visualize_waveform_in_seconds(original_waveform, waveform, sr)
+        if visualization_dir:
+            filename = Path(audio_path).stem
+            visualization_path = os.path.join(
+                visualization_dir, f"{filename}_waveform.png"
+            )
+        else:
+            visualization_path = None
+
+        visualize_waveform_in_seconds(
+            original_waveform, waveform, sr, save_path=visualization_path
+        )
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)
@@ -438,7 +447,9 @@ def prepare_batch(
 
             try:
                 # Process audio file into chunks
-                signal_chunks, noise_chunks = preprocessor.process_audio(audio_file)
+                signal_chunks, noise_chunks = preprocessor.process_audio(
+                    audio_file, visualization_dir="visualizations"
+                )
 
                 # Save signal chunks
                 for i, chunk in enumerate(signal_chunks):
@@ -523,7 +534,7 @@ if __name__ == "__main__":
         "--input_dir",
         "-I",
         type=str,
-        default="data/train_audio_test",
+        default="data/train_audio",
         help="Directory containing audio files",
     )
     parser.add_argument(

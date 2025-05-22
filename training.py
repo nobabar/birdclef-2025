@@ -199,6 +199,7 @@ class BirdSongDataset(Dataset):
         Initialize the dataset.
 
         Args:
+        ----
             processed_dir: Directory with all the processed spectrograms and metadata
             transform: Optional transform to be applied on a sample
             augment: Whether to use augmented samples
@@ -285,6 +286,7 @@ class MixupTransform:
         Initialize the MixupTransform.
 
         Args:
+        ----
             dataset: The dataset to sample from
             num_mix: Maximum number of samples to mix
             alpha: Parameter for beta distribution
@@ -299,10 +301,12 @@ class MixupTransform:
         Apply mixup to the spectrogram and label.
 
         Args:
+        ----
             spectrogram: Input spectrogram
             label: One-hot encoded label
 
         Returns:
+        -------
             Mixed spectrogram and label
 
         """
@@ -552,11 +556,13 @@ class BirdNETLightning(pl.LightningModule):
         Apply mixup augmentation to a batch of spectrograms and labels.
 
         Args:
+        ----
             spectrograms: Batch of spectrograms [batch_size, channels, height, width]
             labels: Batch of one-hot encoded labels [batch_size, num_classes]
             alpha: Parameter for beta distribution (lower = less aggressive mixing)
 
         Returns:
+        -------
             mixed_spectrograms: Mixed batch of spectrograms
             mixed_labels: Mixed batch of labels
 
@@ -611,6 +617,7 @@ def train_birdnet(
     Train the BirdNET model.
 
     Args:
+    ----
         train_data_dir: Directory containing processed training data
         val_data_dir: Directory containing processed validation data (if None, use train_data_dir)
         batch_size: Batch size for training
