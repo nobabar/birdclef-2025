@@ -8,7 +8,13 @@ import torch
 import torchaudio
 import torchaudio.transforms as AT
 from scipy import ndimage
+from silero_vad import get_speech_timestamps, load_silero_vad
 from tqdm import tqdm
+
+from waveform_comparaison import (
+    compare_energy,
+    visualize_waveform_in_seconds,
+)
 
 
 class BirdSongPreprocessor:
@@ -38,6 +44,7 @@ class BirdSongPreprocessor:
             normalized=True,
             norm="slaney",  # Slaney-style mel normalization
         )
+        self.vad_model = load_silero_vad()
 
     def extract_signal_segments(
         self, waveform, threshold_factor=3.5, noise_threshold_factor=2.0
@@ -48,11 +55,13 @@ class BirdSongPreprocessor:
         Implementation based on Sprengel et al., 2016 approach.
 
         Args:
+        ----
             waveform: Input audio waveform
             threshold_factor: Factor for signal detection (3.5 instead of 3.0 in paper)
             noise_threshold_factor: Factor for noise detection (2.0 instead of 2.5 in paper)
 
         Returns:
+        -------
             signal_mask: Boolean mask indicating signal segments
             noise_mask: Boolean mask indicating noise segments
 
@@ -141,9 +150,11 @@ class BirdSongPreprocessor:
         Separate audio into signal (bird vocalization) and noise parts.
 
         Args:
+        ----
             waveform: Input audio waveform
 
         Returns:
+        -------
             signal_waveform: Audio containing only bird vocalizations
             noise_waveform: Audio containing only background noise
 
@@ -161,7 +172,55 @@ class BirdSongPreprocessor:
 
         return signal_waveform, noise_waveform
 
-    def process_audio(self, audio_path, chunk_duration=3.0, overlap=0.5):
+    def remove_human_voice_using_silero(self, waveform):
+        """
+        Remove segments of waveform where human voice is detected using Silero VAD.
+
+        Args:
+        ----
+            waveform: Tensor of shape (1, N)
+
+        Returns:
+        -------
+            waveform with human voice segments removed (time shortened)
+        """
+        # Silero VAD expects 16kHz mono audio
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        if self.sample_rate != 16000:
+            resampler = AT.Resample(orig_freq=self.sample_rate, new_freq=16000)
+            waveform_16k = resampler(waveform)
+        else:
+            waveform_16k = waveform.clone()
+
+        # Detect voice segments
+        speech_timestamps = get_speech_timestamps(
+            waveform_16k[0], self.vad_model, sampling_rate=16000
+        )
+
+        # Invert speech segments to get non-voice segments (to keep)
+        non_voice_segments = []
+        prev_end = 0
+        for segment in speech_timestamps:
+            start = int(segment["start"] * self.sample_rate / 16000)
+            end = int(segment["end"] * self.sample_rate / 16000)
+            if prev_end < start:
+                non_voice_segments.append((prev_end, start))
+            prev_end = end
+        if prev_end < waveform.shape[1]:
+            non_voice_segments.append((prev_end, waveform.shape[1]))
+
+        # Concatenate the kept parts
+        kept_waveform = torch.cat(
+            [waveform[:, start:end] for start, end in non_voice_segments], dim=1
+        )
+
+        return kept_waveform
+
+    def process_audio(
+        self, audio_path, chunk_duration=3.0, overlap=0.5, visualization_dir=None
+    ):
         """
         Process audio file into mel spectrograms.
 
@@ -169,11 +228,13 @@ class BirdSongPreprocessor:
         described in Sprengel et al., using 3-second chunks as recommended in Kahl et al.
 
         Args:
+        ----
             audio_path: Path to audio file
             chunk_duration: Duration of each chunk in seconds
             overlap: Overlap between chunks (0.0-1.0)
 
         Returns:
+        -------
             signal_chunks: List of mel spectrograms containing bird vocalizations
             noise_chunks: List of mel spectrograms containing background noise
 
@@ -189,6 +250,28 @@ class BirdSongPreprocessor:
         # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Remove human voice
+        original_waveform = waveform
+        waveform = self.remove_human_voice_using_silero(waveform)
+
+        # Compare energy before and after voice removal
+        compare_energy(original_waveform, waveform)
+
+        ######
+        # Visualize the waveform
+        ######
+        if visualization_dir:
+            filename = Path(audio_path).stem
+            visualization_path = os.path.join(
+                visualization_dir, f"{filename}_waveform.png"
+            )
+        else:
+            visualization_path = None
+
+        visualize_waveform_in_seconds(
+            original_waveform, waveform, sr, save_path=visualization_path
+        )
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)
@@ -254,6 +337,7 @@ def prepare_batch(
     Prepare a batch of audio files for model training or inference.
 
     Args:
+    ----
         audio_files (list): List of audio file paths
         metadata_path (str): Path to the train.csv file with additional metadata
         save_dir (str): Directory to save the processed audio files
@@ -321,7 +405,7 @@ def prepare_batch(
             existing_signal_files = glob.glob(signal_pattern)
 
             # Get filename for metadata lookup
-            rel_path = os.path.relpath(audio_file, "data/train_audio")
+            rel_path = os.path.relpath(audio_file, "data/train_audio_data")
             filename = rel_path.replace("\\", "/")  # Normalize path separators
             additional_meta = train_metadata.get(filename, {})
 
@@ -371,7 +455,9 @@ def prepare_batch(
 
             try:
                 # Process audio file into chunks
-                signal_chunks, noise_chunks = preprocessor.process_audio(audio_file)
+                signal_chunks, noise_chunks = preprocessor.process_audio(
+                    audio_file, visualization_dir="visualizations"
+                )
 
                 # Save signal chunks
                 for i, chunk in enumerate(signal_chunks):
@@ -449,7 +535,6 @@ def prepare_batch(
 
 
 if __name__ == "__main__":
-    # Example usage
     import argparse
 
     parser = argparse.ArgumentParser(description="Preprocess bird audio files")
