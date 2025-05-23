@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
@@ -13,6 +14,7 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
+from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, Dataset
 
@@ -427,11 +429,9 @@ class BirdNETLightning(pl.LightningModule):
             labels = labels_mixed
 
         # Continue with forward pass and loss calculation
-        y_hat = self(spectrograms)
-        loss = self.criterion(y_hat, labels)
-
-        # Log training metrics
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        outputs = self(spectrograms)
+        loss = self.criterion(outputs, labels)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
 
         return loss
 
@@ -459,8 +459,8 @@ class BirdNETLightning(pl.LightningModule):
         mAP = np.mean(ap_scores) if ap_scores else 0.0
 
         # Log validation metrics
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val_mAP", mAP, on_epoch=True, prog_bar=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_mAP", mAP, on_step=False, on_epoch=True, prog_bar=True)
 
         return {"val_loss": loss, "val_mAP": mAP}
 
@@ -594,13 +594,69 @@ class BirdNETLightning(pl.LightningModule):
         return mixed_spectrograms, mixed_labels
 
 
+def plot_learning_curves(trainer, save_path):
+    """
+    Plot training and validation metrics.
+
+    Args:
+        trainer: PyTorch Lightning trainer instance
+        save_path: Path to save the plot
+
+    """
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+
+    # Get metrics from trainer's logged metrics
+    metrics = trainer.callback_metrics
+
+    # Get training history from logged metrics
+    train_losses = []
+    val_losses = []
+    val_maps = []
+
+    # Access the metrics from the trainer's logged metrics
+    for callback in trainer.callbacks:
+        if isinstance(callback, ModelCheckpoint):
+            train_losses = callback.best_k_models.get("train_loss", [])
+            val_losses = callback.best_k_models.get("val_loss", [])
+            val_maps = callback.best_k_models.get("val_mAP", [])
+
+    # Plot training and validation loss if we have data
+    if train_losses and val_losses:
+        epochs = range(len(train_losses))
+        ax1.plot(epochs, train_losses, "b-", label="Training Loss")
+        ax1.plot(epochs, val_losses, "r-", label="Validation Loss")
+        ax1.set_title("Training and Validation Loss")
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Loss")
+        ax1.legend()
+        ax1.grid(True)
+
+    # Plot validation mAP if we have data
+    if val_maps:
+        epochs = range(len(val_maps))
+        ax2.plot(epochs, val_maps, "g-", label="Validation mAP")
+        ax2.set_title("Validation mAP")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("mAP")
+        ax2.legend()
+        ax2.grid(True)
+
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+    print(f"Learning curves saved to {save_path}")
+
+
 def train_birdnet(
     train_data_dir,
     val_data_dir=None,
     val_split=0.1,
     test_split=0.0,
     batch_size=32,
-    max_epochs=100,
+    max_epochs=10,
     learning_rate=1e-3,
     width_factor=4,
     depth_factor=3,
@@ -608,6 +664,8 @@ def train_birdnet(
     mixup=True,
     num_workers=4,
     checkpoint_dir="checkpoints",
+    plot_curves=False,
+    log_dir="lightning_logs",
 ):
     """
     Train the BirdNET model.
@@ -626,6 +684,8 @@ def train_birdnet(
         mixup: Whether to use mixup augmentation
         num_workers: Number of workers for data loading
         checkpoint_dir: Directory to save checkpoints
+        plot_curves: Whether to plot and save learning curves
+        log_dir: Directory for TensorBoard logs
 
     """
     # Create checkpoint directory
@@ -737,6 +797,13 @@ def train_birdnet(
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    # Create logger
+    logger = TensorBoardLogger(
+        save_dir=log_dir,
+        name="birdnet",  # This will create a subdirectory for your experiment
+        version=None,  # Auto-increment version
+    )
+
     # Create trainer
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -744,10 +811,18 @@ def train_birdnet(
         accelerator="auto",  # Use GPU if available
         devices=1,
         log_every_n_steps=1,
+        logger=logger,  # Use our configured logger
     )
 
     # Train model
     trainer.fit(model, train_loader, val_loader)
+
+    # Plot learning curves if requested
+    if plot_curves:
+        plot_dir = Path(checkpoint_dir) / "plots"
+        plot_dir.mkdir(exist_ok=True)
+        plot_path = plot_dir / "learning_curves.png"
+        plot_learning_curves(trainer, plot_path)
 
     # Test model if test data exists
     if test_loader:
@@ -791,7 +866,7 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=32, help="Batch size for training"
     )
     parser.add_argument(
-        "--max_epochs", type=int, default=100, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=10, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--learning_rate", type=float, default=1e-3, help="Initial learning rate"
@@ -823,6 +898,17 @@ if __name__ == "__main__":
         default="checkpoints",
         help="Directory to save checkpoints",
     )
+    parser.add_argument(
+        "--plot_curves",
+        action="store_true",
+        help="Plot and save learning curves",
+    )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="logs",
+        help="Directory for TensorBoard logs",
+    )
 
     args = parser.parse_args()
 
@@ -841,6 +927,8 @@ if __name__ == "__main__":
         mixup=not args.no_mixup,
         num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
+        plot_curves=args.plot_curves,
+        log_dir=args.log_dir,
     )
 
     print(f"Best model saved at: {best_model_path}")
