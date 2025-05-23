@@ -542,7 +542,7 @@ if __name__ == "__main__":
         "--input_dir",
         "-I",
         type=str,
-        default="data/train_audio_test",
+        default="data/train_audio",
         help="Directory containing audio files",
     )
     parser.add_argument(
