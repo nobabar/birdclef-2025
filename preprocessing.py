@@ -16,8 +16,6 @@ from waveform_comparaison import (
     visualize_waveform_in_seconds,
 )
 
-# from torchaudio.pipelines import WAV2VEC2_ASR_BASE_960H
-
 
 class BirdSongPreprocessor:
     """Preprocess bird song audio files into mel spectrograms."""
@@ -184,7 +182,7 @@ class BirdSongPreprocessor:
 
         Returns:
         -------
-            waveform with human voice segments zeroed out
+            waveform with human voice segments removed (time shortened)
         """
         # Silero VAD expects 16kHz mono audio
         if waveform.shape[0] > 1:
@@ -201,14 +199,24 @@ class BirdSongPreprocessor:
             waveform_16k[0], self.vad_model, sampling_rate=16000
         )
 
-        # Map detected speech timestamps back to original sample rate
-        waveform_clean = waveform.clone()
+        # Invert speech segments to get non-voice segments (to keep)
+        non_voice_segments = []
+        prev_end = 0
         for segment in speech_timestamps:
             start = int(segment["start"] * self.sample_rate / 16000)
             end = int(segment["end"] * self.sample_rate / 16000)
-            waveform_clean[:, start:end] = 0  # zero out human voice
+            if prev_end < start:
+                non_voice_segments.append((prev_end, start))
+            prev_end = end
+        if prev_end < waveform.shape[1]:
+            non_voice_segments.append((prev_end, waveform.shape[1]))
 
-        return waveform_clean
+        # Concatenate the kept parts
+        kept_waveform = torch.cat(
+            [waveform[:, start:end] for start, end in non_voice_segments], dim=1
+        )
+
+        return kept_waveform
 
     def process_audio(
         self, audio_path, chunk_duration=3.0, overlap=0.5, visualization_dir=None
@@ -534,7 +542,7 @@ if __name__ == "__main__":
         "--input_dir",
         "-I",
         type=str,
-        default="data/train_audio",
+        default="data/train_audio_test",
         help="Directory containing audio files",
     )
     parser.add_argument(
