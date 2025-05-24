@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 
@@ -93,104 +94,121 @@ class DownsamplingBlock(nn.Module):
         return out
 
 
-class WideResNet(nn.Module):
-    """Wide ResNet implementation based on BirdNET paper."""
+class SqueezeExcitation(nn.Module):
+    """Squeeze-Excitation block for channel attention."""
 
-    def __init__(self, num_classes, width_factor=4, depth_factor=3, dropout_prob=0.5):
-        """Initialize the Wide ResNet model."""
-        super(WideResNet, self).__init__()
-
-        # Initial number of channels (scaled by width factor K)
-        self.init_channels = 16 * width_factor
-
-        # Pre-processing block
-        self.preprocessing = nn.Sequential(
-            nn.Conv2d(
-                1, self.init_channels, kernel_size=5, stride=1, padding=2, bias=False
-            ),
-            nn.BatchNorm2d(self.init_channels),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=(1, 2)),  # Pooling in time dimension only
-        )
-
-        # Residual stacks
-        # First stack (no downsampling in first block)
-        self.stack1 = self._make_stack(
-            self.init_channels, self.init_channels, depth_factor, 1, dropout_prob
-        )
-
-        # Second stack (with downsampling)
-        self.stack2 = self._make_stack(
-            self.init_channels, 2 * self.init_channels, depth_factor, 2, dropout_prob
-        )
-
-        # Third stack (with downsampling)
-        self.stack3 = nn.Sequential(
-            DownsamplingBlock(
-                2 * self.init_channels, 4 * self.init_channels, dropout_prob
-            ),
-            *[
-                BasicBlock(
-                    4 * self.init_channels, 4 * self.init_channels, 1, dropout_prob
-                )
-                for _ in range(depth_factor - 1)
-            ],
-        )
-
-        # Classification block (as per Schlüter, 2018)
-        # Assuming input is 64x384, after preprocessing and stacks it becomes:
-        # 64x192 -> 32x96 -> 16x48
-        # So the final feature map size is (batch_size, 4*init_channels, 16, 48)
-
-        # 1x1 convolution to reduce channels
-        self.conv_reduce = nn.Conv2d(
-            4 * self.init_channels, 512, kernel_size=1, bias=False
-        )
-        self.bn_reduce = nn.BatchNorm2d(512)
-
-        # Global pooling and classification
-        self.classifier = nn.Conv2d(512, num_classes, kernel_size=1)
-
-    def _make_stack(self, in_channels, out_channels, num_blocks, stride, dropout_prob):
-        layers = []
-        # First block may have downsampling
-        if stride == 2:
-            layers.append(DownsamplingBlock(in_channels, out_channels, dropout_prob))
-        else:
-            layers.append(BasicBlock(in_channels, out_channels, stride, dropout_prob))
-
-        # Rest of the blocks
-        for _ in range(1, num_blocks):
-            layers.append(BasicBlock(out_channels, out_channels, 1, dropout_prob))
-
-        return nn.Sequential(*layers)
+    def __init__(self, channels, reduction_ratio=16):
+        """Initialize the Squeeze-Excitation block."""
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        squeeze_channels = max(1, channels // reduction_ratio)
+        self.fc1 = nn.Conv2d(
+            channels, squeeze_channels, 1
+        )  # Using Conv2d instead of Linear for shape handling
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(squeeze_channels, channels, 1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        """Forward pass for the Wide ResNet model."""
-        # Input shape: [batch_size, 1, 64, 384] (mel spectrogram)
+        """Forward pass for the Squeeze-Excitation block."""
+        scale = self.avg_pool(x)
+        scale = self.fc1(scale)
+        scale = self.relu(scale)
+        scale = self.fc2(scale)
+        scale = self.sigmoid(scale)
+        return x * scale
 
-        # Pre-processing
-        out = self.preprocessing(x)  # [batch_size, init_channels, 64, 192]
 
-        # Residual stacks
-        out = self.stack1(out)  # [batch_size, init_channels, 64, 192]
-        out = self.stack2(out)  # [batch_size, 2*init_channels, 32, 96]
-        out = self.stack3(out)  # [batch_size, 4*init_channels, 16, 48]
+class InvertedResidual(nn.Module):
+    """Inverted Residual block with SE (MBConv)."""
 
-        # Classification block
-        out = F.relu(self.bn_reduce(self.conv_reduce(out)))  # [batch_size, 512, 16, 48]
-        out = self.classifier(out)  # [batch_size, num_classes, 16, 48]
+    def __init__(
+        self, in_channels, out_channels, stride=1, expand_ratio=6, dropout_prob=0.5
+    ):
+        """Initialize the Inverted Residual block."""
+        super().__init__()
+        self.stride = stride
+        self.use_res_connect = self.stride == 1 and in_channels == out_channels
 
-        # Global log-mean-exponential pooling (as described in the paper)
-        # This produces 3 predictions per 3-second spectrogram (1 per second)
-        out = torch.exp(out)
-        out = torch.mean(out, dim=(2, 3))  # Global average pooling
-        out = torch.log(out + 1e-7)  # Log to stabilize
+        exp_channels = in_channels * expand_ratio
+        self.conv = nn.Sequential(
+            # Expansion
+            nn.Conv2d(in_channels, exp_channels, 1, bias=False),
+            nn.BatchNorm2d(exp_channels),
+            nn.SiLU(),  # SiLU/Swish activation as used in EfficientNet
+            # Depthwise
+            nn.Conv2d(
+                exp_channels,
+                exp_channels,
+                3,
+                stride,
+                1,
+                groups=exp_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(exp_channels),
+            nn.SiLU(),
+            # Squeeze-Excitation
+            SqueezeExcitation(exp_channels),
+            # Projection
+            nn.Conv2d(exp_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout2d(p=dropout_prob),
+        )
 
-        # Apply sigmoid activation for multi-label classification
-        out = torch.sigmoid(out)
+    def forward(self, x):
+        """Forward pass for the Inverted Residual block."""
+        if self.use_res_connect:
+            return x + self.conv(x)
+        return self.conv(x)
 
-        return out
+
+class BirdNETv2(nn.Module):
+    """BirdNET-V2 implementation with EfficientNet-like architecture."""
+
+    def __init__(self, num_classes, dropout_prob=0.5):
+        """Initialize the BirdNETv2 model."""
+        super().__init__()
+
+        # Initial processing
+        self.conv_stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+        )
+
+        # EfficientNet-like backbone (simplified version)
+        self.blocks = nn.Sequential(
+            InvertedResidual(32, 64, stride=1, dropout_prob=dropout_prob),
+            InvertedResidual(64, 64, stride=1, dropout_prob=dropout_prob),
+            InvertedResidual(64, 128, stride=2, dropout_prob=dropout_prob),
+            InvertedResidual(128, 128, stride=1, dropout_prob=dropout_prob),
+            InvertedResidual(128, 256, stride=2, dropout_prob=dropout_prob),
+            InvertedResidual(256, 256, stride=1, dropout_prob=dropout_prob),
+            InvertedResidual(256, 512, stride=2, dropout_prob=dropout_prob),
+            InvertedResidual(512, 512, stride=1, dropout_prob=dropout_prob),
+        )
+
+        # Final layers
+        self.conv_head = nn.Sequential(
+            nn.Conv2d(512, 1024, 1, bias=False), nn.BatchNorm2d(1024), nn.SiLU()
+        )
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(dropout_prob)
+        self.classifier = nn.Linear(1024, num_classes)
+
+    def forward(self, x):
+        """Forward pass for the BirdNETv2 model."""
+        # Input shape: [batch_size, 1, height, width]
+        x = self.conv_stem(x)
+        x = self.blocks(x)
+        x = self.conv_head(x)
+        x = self.avg_pool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.classifier(x)
+        return x
 
 
 class BirdSongDataset(Dataset):
@@ -217,8 +235,16 @@ class BirdSongDataset(Dataset):
         # Filter for signal spectrograms only (not noise)
         self.metadata = self.metadata[self.metadata["type"] == "signal"]
 
-        # Get unique classes (folders)
-        self.classes = sorted(self.metadata["folder"].unique())
+        # Get all unique classes from both primary and secondary labels
+        primary_labels = set(self.metadata["train_primary_label"].unique())
+        # Convert string representation of list to actual list and get unique values
+        secondary_labels = set()
+        for labels in self.metadata["train_secondary_labels"].dropna():
+            labels_list = ast.literal_eval(labels)
+            secondary_labels.update(labels_list)
+
+        # Combine and sort all unique classes
+        self.classes = sorted(primary_labels.union(secondary_labels))
         self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
 
         print(
@@ -234,49 +260,45 @@ class BirdSongDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        # Get file path directly from metadata
-        file_path = self.metadata.iloc[idx]["processed_file"]
+        # Get file info from metadata
+        row = self.metadata.iloc[idx]
+        file_path = row["processed_file"]
 
-        # Load spectrogram
+        # Create multi-label tensor
+        labels = torch.zeros(len(self.classes), dtype=torch.float32)
+
+        # Set primary label
+        primary_idx = self.class_to_idx[row["train_primary_label"]]
+        labels[primary_idx] = 1.0
+
+        # Set secondary labels if they exist
+        if pd.notna(row["train_secondary_labels"]):
+            secondary_list = ast.literal_eval(row["train_secondary_labels"])
+            for label in secondary_list:
+                if label in self.class_to_idx:
+                    sec_idx = self.class_to_idx[label]
+                    labels[sec_idx] = 1.0
+
         try:
             spectrogram = torch.load(file_path)
             # Ensure spectrogram is float32
-            spectrogram = spectrogram.float()
-        except FileNotFoundError:
-            # If the path in metadata is relative, try to resolve it
-            file_path = self.processed_dir / file_path
-            spectrogram = torch.load(file_path).float()
+            spectrogram = spectrogram.to(torch.float32)
 
-        # Get label (folder name is the class)
-        folder = self.metadata.iloc[idx]["folder"]
-        label_idx = self.class_to_idx[folder]
+            if self.transform:
+                spectrogram = self.transform(spectrogram)
 
-        # Convert to one-hot encoding (ensure float32)
-        label = torch.zeros(len(self.classes), dtype=torch.float32)
-        label[label_idx] = 1.0
+            # Return weight as float32
+            return spectrogram, labels, torch.tensor(1.0, dtype=torch.float32)
 
-        # Get sample weight based on metadata
-        weight = torch.tensor(1.0, dtype=torch.float32)
-
-        # Adjust weight based on recording quality
-        if "train_rating" in self.metadata.columns and not pd.isna(
-            self.metadata.iloc[idx]["train_rating"]
-        ):
-            rating = float(self.metadata.iloc[idx]["train_rating"])
-            # Higher rated recordings get higher weights
-            weight *= 1.0 + rating / 5.0
-
-        # Adjust weight for underrepresented collections
-        if "train_collection" in self.metadata.columns:
-            collection = self.metadata.iloc[idx]["train_collection"]
-            if collection == "iNat":  # If iNaturalist is underrepresented
-                weight *= 1.2
-
-        # Apply transforms if any
-        if self.transform:
-            spectrogram = self.transform(spectrogram)
-
-        return spectrogram, label, weight
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            # Return a zero spectrogram of the expected shape if loading fails
+            # Return zero spectrogram and weight as float32
+            return (
+                torch.zeros(1, 64, 384, dtype=torch.float32),
+                labels,
+                torch.tensor(0.0, dtype=torch.float32),
+            )
 
 
 class MixupTransform:
@@ -340,21 +362,16 @@ class BirdNETLightning(pl.LightningModule):
         self,
         num_classes,
         learning_rate=1e-3,
-        width_factor=4,
-        depth_factor=3,
         dropout_prob=0.5,
         mixup=True,
         dataset=None,
     ):
         """Initialize the BirdNETLightning module."""
-        super(BirdNETLightning, self).__init__()
-        self.save_hyperparameters()
+        super().__init__()
 
         # Model
-        self.model = WideResNet(
+        self.model = BirdNETv2(
             num_classes=num_classes,
-            width_factor=width_factor,
-            depth_factor=depth_factor,
             dropout_prob=dropout_prob,
         )
 
@@ -363,12 +380,13 @@ class BirdNETLightning(pl.LightningModule):
 
         # Mixup flag
         self.mixup = mixup
-
-        # Binary cross-entropy loss for multi-label classification
-        self.criterion = nn.BCELoss()
-
-        # Dataset for mixup
         self.dataset = dataset
+
+        # Use BCEWithLogitsLoss for multi-label classification
+        self.criterion = nn.BCEWithLogitsLoss()
+
+        # Save hyperparameters
+        self.save_hyperparameters(ignore=["dataset"])
 
     def forward(self, x):
         """Forward pass for the BirdNETLightning module."""
@@ -379,86 +397,48 @@ class BirdNETLightning(pl.LightningModule):
         # Unpack batch with metadata
         spectrograms, labels, weights = batch
 
-        # Apply adaptive mixup based on metadata
-        if self.mixup:
-            # Create a default mask (all False)
-            batch_size = spectrograms.shape[0]
-            high_quality_mask = torch.zeros(
-                batch_size, dtype=torch.bool, device=spectrograms.device
-            )
-
-            # If weights > 1.8, consider it high quality (rating >= 4 would give weight >= 1.8)
-            # This is based on the weight calculation: weight *= 1.0 + rating / 5.0
-            high_quality_mask = weights > 1.8
-
-            # Apply different mixup strategies based on quality
-            spectrograms_mixed = torch.zeros_like(spectrograms)
-            labels_mixed = torch.zeros_like(labels)
-
-            # Process high quality recordings if any exist
-            if high_quality_mask.any():
-                # High quality recordings get gentler mixup
-                high_quality_specs = spectrograms[high_quality_mask]
-                high_quality_labels = labels[high_quality_mask]
-
-                # Apply mixup with lower alpha (less aggressive)
-                mixed_specs, mixed_labels = self.apply_mixup(
-                    high_quality_specs,
-                    high_quality_labels,
-                    alpha=0.2,  # Less aggressive
-                )
-                spectrograms_mixed[high_quality_mask] = mixed_specs
-                labels_mixed[high_quality_mask] = mixed_labels
-
-            # Process lower quality recordings if any exist
-            if (~high_quality_mask).any():
-                # Lower quality recordings get more aggressive mixup
-                low_quality_specs = spectrograms[~high_quality_mask]
-                low_quality_labels = labels[~high_quality_mask]
-
-                # Apply mixup with higher alpha (more aggressive)
-                mixed_specs, mixed_labels = self.apply_mixup(
-                    low_quality_specs,
-                    low_quality_labels,
-                    alpha=0.4,  # More aggressive
-                )
-                spectrograms_mixed[~high_quality_mask] = mixed_specs
-                labels_mixed[~high_quality_mask] = mixed_labels
-
-            spectrograms = spectrograms_mixed
-            labels = labels_mixed
+        # Apply mixup if enabled
+        if self.mixup and self.dataset is not None:
+            spectrograms, labels = self.apply_mixup(spectrograms, labels)
 
         # Continue with forward pass and loss calculation
         outputs = self(spectrograms)
         loss = self.criterion(outputs, labels)
+
+        # Add more detailed logging
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_output_mean", outputs.mean(), on_step=False, on_epoch=True)
+        self.log("train_output_std", outputs.std(), on_step=False, on_epoch=True)
+        self.log(
+            "train_labels_mean", labels.float().mean(), on_step=False, on_epoch=True
+        )
+
+        # Print some debugging info occasionally
+        if batch_idx % 100 == 0:
+            print(f"\nTraining batch {batch_idx}:")
+            print(f"Output range: [{outputs.min():.3f}, {outputs.max():.3f}]")
+            print(f"Labels range: [{labels.min():.3f}, {labels.max():.3f}]")
+            print(f"Loss: {loss.item():.3f}")
 
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Perform validation step for the BirdNETLightning module."""
-        x, y, _ = batch
-        y_hat = self(x)
-        loss = self.criterion(y_hat, y)
+        spectrograms, labels, weights = batch
+        outputs = self(spectrograms)
+        loss = self.criterion(outputs, labels)
 
-        # Calculate mAP (mean Average Precision)
-        y_np = y.cpu().numpy()
-        y_hat_np = y_hat.cpu().numpy()
+        # Calculate mAP only if there are positive labels
+        predictions = outputs.cpu().numpy()
+        targets = labels.cpu().numpy()
 
-        # Handle case where a class has no positive samples in the batch
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ap_scores = [
-                average_precision_score(y_np[:, i], y_hat_np[:, i])
-                if np.sum(y_np[:, i]) > 0
-                else np.nan
-                for i in range(y_np.shape[1])
-            ]
+        # Check if there are any positive labels
+        if targets.sum() > 0:
+            mAP = average_precision_score(targets, predictions, average="macro")
+        else:
+            mAP = 0.0  # or some other appropriate value
+            print(f"Warning: Batch {batch_idx} has no positive labels")
 
-        # Filter out NaN values
-        ap_scores = [score for score in ap_scores if not np.isnan(score)]
-        mAP = np.mean(ap_scores) if ap_scores else 0.0
-
-        # Log validation metrics
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_mAP", mAP, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -658,8 +638,6 @@ def train_birdnet(
     batch_size=32,
     max_epochs=10,
     learning_rate=1e-3,
-    width_factor=4,
-    depth_factor=3,
     dropout_prob=0.5,
     mixup=True,
     num_workers=4,
@@ -678,8 +656,6 @@ def train_birdnet(
         batch_size: Batch size for training
         max_epochs: Maximum number of epochs to train
         learning_rate: Initial learning rate
-        width_factor: Width scaling factor for Wide ResNet (K)
-        depth_factor: Depth scaling factor for Wide ResNet (N)
         dropout_prob: Initial dropout probability
         mixup: Whether to use mixup augmentation
         num_workers: Number of workers for data loading
@@ -697,6 +673,20 @@ def train_birdnet(
         transform=None,
         augment=False,
     )
+
+    # Add some debug info
+    print("\nFirst few classes:", full_dataset.classes[:5])
+    print("Total number of classes:", len(full_dataset.classes))
+    print("Total number of samples:", len(full_dataset))
+
+    # Sample a few items to verify
+    sample_loader = DataLoader(full_dataset, batch_size=4, shuffle=True)
+    batch = next(iter(sample_loader))
+    spectrograms, labels, weights = batch
+    print("\nSample batch shapes:")
+    print("Spectrograms:", spectrograms.shape)
+    print("Labels:", labels.shape)
+    print("Number of positive labels in batch:", labels.sum().item())
 
     # If validation directory is provided, use it and set val_split to 0.0
     if val_data_dir:
@@ -771,8 +761,6 @@ def train_birdnet(
     model = BirdNETLightning(
         num_classes=num_classes,
         learning_rate=learning_rate,
-        width_factor=width_factor,
-        depth_factor=depth_factor,
         dropout_prob=dropout_prob,
         mixup=mixup,
         dataset=train_dataset if mixup else None,
@@ -866,22 +854,10 @@ if __name__ == "__main__":
         "--batch_size", type=int, default=32, help="Batch size for training"
     )
     parser.add_argument(
-        "--max_epochs", type=int, default=10, help="Maximum number of epochs to train"
+        "--max_epochs", type=int, default=3, help="Maximum number of epochs to train"
     )
     parser.add_argument(
         "--learning_rate", type=float, default=1e-3, help="Initial learning rate"
-    )
-    parser.add_argument(
-        "--width_factor",
-        type=int,
-        default=4,
-        help="Width scaling factor for Wide ResNet (K)",
-    )
-    parser.add_argument(
-        "--depth_factor",
-        type=int,
-        default=3,
-        help="Depth scaling factor for Wide ResNet (N)",
     )
     parser.add_argument(
         "--dropout_prob", type=float, default=0.5, help="Initial dropout probability"
@@ -921,8 +897,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_epochs=args.max_epochs,
         learning_rate=args.learning_rate,
-        width_factor=args.width_factor,
-        depth_factor=args.depth_factor,
         dropout_prob=args.dropout_prob,
         mixup=not args.no_mixup,
         num_workers=args.num_workers,
