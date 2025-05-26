@@ -17,7 +17,9 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from sklearn.metrics import average_precision_score
+from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 class BasicBlock(nn.Module):
@@ -675,18 +677,8 @@ def train_birdnet(
     )
 
     # Add some debug info
-    print("\nFirst few classes:", full_dataset.classes[:5])
     print("Total number of classes:", len(full_dataset.classes))
     print("Total number of samples:", len(full_dataset))
-
-    # Sample a few items to verify
-    sample_loader = DataLoader(full_dataset, batch_size=4, shuffle=True)
-    batch = next(iter(sample_loader))
-    spectrograms, labels, weights = batch
-    print("\nSample batch shapes:")
-    print("Spectrograms:", spectrograms.shape)
-    print("Labels:", labels.shape)
-    print("Number of positive labels in batch:", labels.sum().item())
 
     # If validation directory is provided, use it and set val_split to 0.0
     if val_data_dir:
@@ -697,23 +689,103 @@ def train_birdnet(
         )
         val_split = 0.0
 
-    # Create datasets based on split configuration
-    # Calculate split sizes
+    # Create stratified splits
     dataset_size = len(full_dataset)
-    test_size = int(dataset_size * test_split)
-    val_size = int(dataset_size * val_split)
-    train_size = dataset_size - test_size - val_size
 
-    # Create random splits
-    generator = torch.Generator().manual_seed(42)  # For reproducibility
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size, test_size], generator=generator
+    # Get all labels to use for stratification
+    all_labels = []
+    label_counts = {}
+
+    # First pass: count samples per label
+    print("\nAnalyzing dataset distribution...")
+    for i in tqdm(range(dataset_size), desc="Counting samples per class"):
+        _, labels, _ = full_dataset[i]
+        positive_indices = torch.where(labels == 1)[0]
+        if len(positive_indices) > 0:
+            strat_label = positive_indices[0].item()
+            label_counts[strat_label] = label_counts.get(strat_label, 0) + 1
+
+    # Find labels with enough samples for stratification (at least 3 samples)
+    valid_labels = {label for label, count in label_counts.items() if count >= 3}
+
+    # After calculating valid_labels:
+    print("\nClass distribution:")
+    sorted_counts = sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
+    for label, count in sorted_counts[:10]:  # Print top 10 most common classes
+        species_name = full_dataset.classes[label]
+        print(f"Species {species_name}: {count} samples")
+    print("...")
+    for label, count in sorted_counts[-10:]:  # Print bottom 10 least common classes
+        species_name = full_dataset.classes[label]
+        print(f"Species {species_name}: {count} samples")
+
+    # Second pass: assign stratification labels
+    for i in tqdm(range(dataset_size), desc="Assigning stratification labels"):
+        _, labels, _ = full_dataset[i]
+        positive_indices = torch.where(labels == 1)[0]
+
+        # Use first valid label, or 0 if none found
+        strat_label = 0
+        if len(positive_indices) > 0:
+            for idx in positive_indices:
+                if idx.item() in valid_labels:
+                    strat_label = idx.item()
+                    break
+        all_labels.append(strat_label)
+
+    # Print some statistics
+    print(f"\nFound {len(valid_labels)} classes with ≥3 samples for stratification")
+    print(f"Min samples per class: {min(label_counts.values())}")
+    print(f"Max samples per class: {max(label_counts.values())}")
+
+    # Create stratified split
+    sss = StratifiedShuffleSplit(
+        n_splits=1, test_size=test_split + val_split, random_state=42
+    )
+
+    # Get train and temp indices
+    train_idx, temp_idx = next(sss.split(np.zeros(len(all_labels)), all_labels))
+
+    # Use simple random split when stratification fails
+    if val_split > 0:
+        val_test_labels = [all_labels[i] for i in temp_idx]
+        try:
+            sss_val = StratifiedShuffleSplit(
+                n_splits=1,
+                test_size=test_split / (test_split + val_split),
+                random_state=42,
+            )
+            val_idx_temp, test_idx_temp = next(
+                sss_val.split(np.zeros(len(temp_idx)), val_test_labels)
+            )
+        except ValueError:
+            print(
+                "\nWarning: Falling back to random split for validation/test due to insufficient samples"
+            )
+            # Use random split instead
+            n_val = int(len(temp_idx) * val_split / (val_split + test_split))
+            val_idx_temp = np.arange(n_val)
+            test_idx_temp = np.arange(n_val, len(temp_idx))
+
+        val_idx = temp_idx[val_idx_temp]
+        test_idx = temp_idx[test_idx_temp]
+    else:
+        test_idx = temp_idx
+        val_idx = []
+
+    # Create subset datasets
+    train_dataset = torch.utils.data.Subset(full_dataset, train_idx)
+    val_dataset = (
+        torch.utils.data.Subset(full_dataset, val_idx) if val_split > 0 else None
+    )
+    test_dataset = (
+        torch.utils.data.Subset(full_dataset, test_idx) if test_split > 0 else None
     )
 
     print(
-        f"Dataset split: {train_size} train ({train_size/dataset_size:.1%}), "
-        f"{val_size} validation ({val_size/dataset_size:.1%}), "
-        f"{test_size} test ({test_size/dataset_size:.1%})"
+        f"Dataset split: {len(train_idx)} train ({len(train_idx)/dataset_size:.1%}), "
+        f"{len(val_idx)} validation ({len(val_idx)/dataset_size:.1%}), "
+        f"{len(test_idx)} test ({len(test_idx)/dataset_size:.1%})"
     )
 
     # Set augmentation for training set
