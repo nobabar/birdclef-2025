@@ -22,10 +22,12 @@ class BirdSongAugmenter:
         Apply frequency shift augmentation.
 
         Args:
+        ----
             spec: Input spectrogram (1, freq_bins, time_bins)
             max_shift_pct: Maximum shift as percentage of frequency bins
 
         Returns:
+        -------
             Augmented spectrogram
 
         """
@@ -58,10 +60,12 @@ class BirdSongAugmenter:
         Apply time shift augmentation.
 
         Args:
+        ----
             spec: Input spectrogram (1, freq_bins, time_bins)
             max_shift_pct: Maximum shift as percentage of time bins
 
         Returns:
+        -------
             Augmented spectrogram
 
         """
@@ -119,11 +123,13 @@ class BirdSongAugmenter:
         Add random noise from a collection of noise spectrograms.
 
         Args:
+        ----
             spec: Input spectrogram
             noise_specs: List of noise spectrograms
             max_weight: Maximum weight for noise addition
 
         Returns:
+        -------
             Augmented spectrogram
 
         """
@@ -187,6 +193,7 @@ def augment_dataset(
     Each augmented version can have up to 3 different augmentation techniques applied.
 
     Args:
+    ----
         processed_dir: Directory containing processed spectrograms
         output_dir: Directory to save augmented spectrograms
         augmentations_per_sample: Number of augmented versions to create per sample

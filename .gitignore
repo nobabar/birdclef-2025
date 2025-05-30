@@ -45,6 +45,7 @@ data/
 datasets/
 raw_data/
 processed_data/
+visualizations/
 *.csv
 *.json
 *.npy
