@@ -216,92 +216,60 @@ class BirdNETv2(nn.Module):
 class BirdSongDataset(Dataset):
     """Dataset for loading processed bird song spectrograms."""
 
-    def __init__(self, processed_dir, transform=None, augment=False):
-        """
-        Initialize the dataset.
-
-        Args:
-        ----
-            processed_dir: Directory with all the processed spectrograms and metadata
-            transform: Optional transform to be applied on a sample
-            augment: Whether to use augmented samples
-
-        """
-        self.processed_dir = Path(processed_dir)
+    def __init__(self, data_dir, metadata_path, transform=None):
+        """Initialize the dataset."""
+        self.data_dir = Path(data_dir)
         self.transform = transform
-        self.augment = augment
 
-        # Load metadata from the processed directory
-        metadata_path = self.processed_dir / "metadata.csv"
-        self.metadata = pd.read_csv(metadata_path)
+        # Read metadata with proper handling of missing values
+        self.metadata = pd.read_csv(metadata_path, na_values=["", "nan", "NaN", "None"])
 
-        # Filter for signal spectrograms only (not noise)
+        # Filter out rows with missing primary labels
+        self.metadata = self.metadata.dropna(subset=["primary_label"])
+
+        # Get unique classes from primary_label column
+        unique_classes = sorted(self.metadata["primary_label"].unique())
+        self.classes = unique_classes
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+
+        # Filter for signal chunks only
         self.metadata = self.metadata[self.metadata["type"] == "signal"]
-
-        # Get all unique classes from both primary and secondary labels
-        primary_labels = set(self.metadata["train_primary_label"].unique())
-        # Convert string representation of list to actual list and get unique values
-        secondary_labels = set()
-        for labels in self.metadata["train_secondary_labels"].dropna():
-            labels_list = ast.literal_eval(labels)
-            secondary_labels.update(labels_list)
-
-        # Combine and sort all unique classes
-        self.classes = sorted(primary_labels.union(secondary_labels))
-        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
 
         print(
             f"Loaded {len(self.metadata)} signal chunks across {len(self.classes)} classes"
         )
+        print(f"Total number of classes: {len(self.classes)}")
+        print(f"Total number of samples: {len(self.metadata)}")
 
     def __len__(self):
         """Get the length of the dataset."""
         return len(self.metadata)
 
     def __getitem__(self, idx):
-        """Get an item from the dataset."""
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-
-        # Get file info from metadata
+        """Get a single item from the dataset."""
         row = self.metadata.iloc[idx]
-        file_path = row["processed_file"]
 
-        # Create multi-label tensor
-        labels = torch.zeros(len(self.classes), dtype=torch.float32)
+        # Load the preprocessed spectrogram
+        spec = torch.load(row["processed_file"])
 
-        # Set primary label
-        primary_idx = self.class_to_idx[row["train_primary_label"]]
+        # Get class index from primary_label
+        primary_idx = self.class_to_idx[row["primary_label"]]
+
+        # Create one-hot encoded labels
+        labels = torch.zeros(len(self.classes))
         labels[primary_idx] = 1.0
 
-        # Set secondary labels if they exist
-        if pd.notna(row["train_secondary_labels"]):
-            secondary_list = ast.literal_eval(row["train_secondary_labels"])
-            for label in secondary_list:
+        # Add secondary labels if they exist and are valid
+        if pd.notna(row["secondary_labels"]) and row["secondary_labels"] != "[]":
+            secondary_labels = ast.literal_eval(row["secondary_labels"])
+            for label in secondary_labels:
                 if label in self.class_to_idx:
-                    sec_idx = self.class_to_idx[label]
-                    labels[sec_idx] = 1.0
+                    labels[self.class_to_idx[label]] = 1.0
 
-        try:
-            spectrogram = torch.load(file_path)
-            # Ensure spectrogram is float32
-            spectrogram = spectrogram.to(torch.float32)
+        if self.transform:
+            spec = self.transform(spec)
 
-            if self.transform:
-                spectrogram = self.transform(spectrogram)
-
-            # Return weight as float32
-            return spectrogram, labels, torch.tensor(1.0, dtype=torch.float32)
-
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            # Return a zero spectrogram of the expected shape if loading fails
-            # Return zero spectrogram and weight as float32
-            return (
-                torch.zeros(1, 64, 384, dtype=torch.float32),
-                labels,
-                torch.tensor(0.0, dtype=torch.float32),
-            )
+        return spec, labels, row["processed_file"]
 
 
 class MixupTransform:
@@ -411,44 +379,108 @@ class BirdNETLightning(pl.LightningModule):
         outputs = self(spectrograms)
         loss = self.criterion(outputs, labels)
 
-        # Add more detailed logging
-        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("train_output_mean", outputs.mean(), on_step=False, on_epoch=True)
-        self.log("train_output_std", outputs.std(), on_step=False, on_epoch=True)
+        # Log metrics
+        batch_size = spectrograms.size(0)
         self.log(
-            "train_labels_mean", labels.float().mean(), on_step=False, on_epoch=True
+            "train_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=batch_size,
         )
-
-        # Print some debugging info occasionally
-        if batch_idx % 100 == 0:
-            print(f"\nTraining batch {batch_idx}:")
-            print(f"Output range: [{outputs.min():.3f}, {outputs.max():.3f}]")
-            print(f"Labels range: [{labels.min():.3f}, {labels.max():.3f}]")
-            print(f"Loss: {loss.item():.3f}")
+        self.log(
+            "train_output_mean",
+            outputs.mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train_output_std",
+            outputs.std(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train_labels_mean",
+            labels.float().mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
 
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Perform validation step for the BirdNETLightning module."""
-        spectrograms, labels, weights = batch
+        spectrograms, labels, _ = batch
         outputs = self(spectrograms)
         loss = self.criterion(outputs, labels)
 
-        # Calculate mAP only if there are positive labels
-        predictions = outputs.cpu().numpy()
-        targets = labels.cpu().numpy()
+        # Store predictions and targets for epoch end calculation
+        self.validation_step_outputs.append(
+            {
+                "preds": outputs.detach().cpu(),
+                "targets": labels.detach().cpu(),
+                "loss": loss.detach().cpu(),
+            }
+        )
 
-        # Check if there are any positive labels
-        if targets.sum() > 0:
-            mAP = average_precision_score(targets, predictions, average="macro")
+        return loss
+
+    def on_validation_epoch_start(self):
+        """Initialize lists to store validation outputs."""
+        self.validation_step_outputs = []
+
+    def on_validation_epoch_end(self):
+        """Calculate metrics for the entire validation set."""
+        # Stack all predictions and targets
+        all_preds = torch.cat([x["preds"] for x in self.validation_step_outputs])
+        all_targets = torch.cat([x["targets"] for x in self.validation_step_outputs])
+        losses = torch.stack([x["loss"] for x in self.validation_step_outputs])
+
+        # Calculate mean loss
+        mean_loss = losses.mean()
+
+        # Convert to numpy for sklearn metrics
+        all_preds_np = all_preds.numpy()
+        all_targets_np = all_targets.numpy()
+
+        # Calculate mAP for each class that has at least one positive sample
+        valid_class_aps = []
+        for i in range(all_targets_np.shape[1]):
+            if (
+                all_targets_np[:, i].sum() > 0
+            ):  # If there's at least one positive sample
+                ap = average_precision_score(all_targets_np[:, i], all_preds_np[:, i])
+                valid_class_aps.append(ap)
+
+        # Calculate macro mAP only over classes that appeared in this validation set
+        mAP = np.mean(valid_class_aps) if valid_class_aps else 0.0
+
+        # Log metrics
+        total_samples = len(all_targets)
+        self.log("val_loss", mean_loss, prog_bar=True, batch_size=total_samples)
+        self.log("val_mAP", mAP, prog_bar=True, batch_size=total_samples)
+
+        # Clean up
+        self.validation_step_outputs.clear()
+
+        # Reduce dropout probability by 0.1 when learning rate is reduced
+        # This is mentioned in the paper
+        if hasattr(self, "last_lr") and self.last_lr != self.learning_rate:
+            # Learning rate was reduced
+            for module in self.modules():
+                if isinstance(module, nn.Dropout2d):
+                    module.p = max(0.0, module.p - 0.1)
+
+            self.last_lr = self.learning_rate
         else:
-            mAP = 0.0  # or some other appropriate value
-            print(f"Warning: Batch {batch_idx} has no positive labels")
+            self.last_lr = self.learning_rate
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val_mAP", mAP, on_step=False, on_epoch=True, prog_bar=True)
-
-        return {"val_loss": loss, "val_mAP": mAP}
+        return {"val_loss": mean_loss, "val_mAP": mAP}
 
     def test_step(self, batch, batch_idx):
         """Test step for the BirdNETLightning module."""
@@ -498,40 +530,6 @@ class BirdNETLightning(pl.LightningModule):
                 "interval": "epoch",
             },
         }
-
-    def on_validation_epoch_end(self):
-        """Analyze performance by metadata categories."""
-        # Reduce dropout probability by 0.1 when learning rate is reduced
-        # This is mentioned in the paper
-        if hasattr(self, "last_lr") and self.last_lr != self.learning_rate:
-            # Learning rate was reduced
-            for module in self.modules():
-                if isinstance(module, nn.Dropout2d):
-                    module.p = max(0.0, module.p - 0.1)
-
-            self.last_lr = self.learning_rate
-        else:
-            self.last_lr = self.learning_rate
-
-        # Analyze performance by metadata categories
-        if hasattr(self, "val_metadata"):
-            # Group results by collection
-            collection_metrics = {}
-            for collection in self.val_metadata["train_collection"].unique():
-                mask = self.val_metadata["train_collection"] == collection
-                collection_preds = self.val_preds[mask]
-                collection_targets = self.val_targets[mask]
-
-                # Calculate mAP for this collection
-                collection_map = average_precision_score(
-                    collection_targets.cpu().numpy(), collection_preds.cpu().numpy()
-                )
-
-                collection_metrics[collection] = collection_map
-                self.log(f"val_mAP_{collection}", collection_map)
-
-            # Log geographic performance
-            # ... similar analysis by region ...
 
     def apply_mixup(self, spectrograms, labels, alpha=0.2):
         """
@@ -653,34 +651,22 @@ def train_birdnet(
     plot_curves=False,
     log_dir="lightning_logs",
 ):
-    """
-    Train the BirdNET model.
+    """Train the BirdNET model."""
+    # Convert string paths to Path objects
+    train_data_dir = Path(train_data_dir)
+    if val_data_dir:
+        val_data_dir = Path(val_data_dir)
+    checkpoint_dir = Path(checkpoint_dir)
+    log_dir = Path(log_dir)
 
-    Args:
-    ----
-        train_data_dir: Directory containing processed training data
-        val_data_dir: Directory containing processed validation data (if None, use train_data_dir)
-        val_split: Fraction of data to use for validation (0.0 to 1.0)
-        test_split: Fraction of data to use for testing (0.0 to 1.0)
-        batch_size: Batch size for training
-        max_epochs: Maximum number of epochs to train
-        learning_rate: Initial learning rate
-        dropout_prob: Initial dropout probability
-        mixup: Whether to use mixup augmentation
-        num_workers: Number of workers for data loading
-        checkpoint_dir: Directory to save checkpoints
-        plot_curves: Whether to plot and save learning curves
-        log_dir: Directory for TensorBoard logs
-
-    """
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Load the full dataset
     full_dataset = BirdSongDataset(
-        processed_dir=train_data_dir,
+        data_dir=train_data_dir,
+        metadata_path=train_data_dir / "metadata.csv",
         transform=None,
-        augment=False,
     )
 
     # Add some debug info
@@ -690,9 +676,9 @@ def train_birdnet(
     # If validation directory is provided, use it and set val_split to 0.0
     if val_data_dir:
         val_dataset = BirdSongDataset(
-            processed_dir=val_data_dir,
+            data_dir=val_data_dir,
+            metadata_path=val_data_dir / "metadata.csv",
             transform=None,
-            augment=False,
         )
         val_split = 0.0
 
@@ -896,6 +882,11 @@ def train_birdnet(
         print("\nEvaluating model on test set...")
         test_results = trainer.test(model, test_loader, verbose=True)
         print(f"Test results: {test_results}")
+
+    # After training is complete and you have your best model
+    scripted_model = torch.jit.script(model)
+    scripted_model.save("EfficientNetV2_S_BirdNET.pt")
+    print("Model saved to EfficientNetV2_S_BirdNET.pt")
 
     # Return best model path
     return checkpoint_callback.best_model_path
