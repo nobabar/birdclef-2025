@@ -1,20 +1,38 @@
 import glob
 import os
 from pathlib import Path
+from queue import Queue
+from threading import Lock
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 import torchaudio
 import torchaudio.transforms as AT
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from scipy import ndimage
 from silero_vad import get_speech_timestamps, load_silero_vad
-from tqdm import tqdm
 
 from waveform_comparaison import (
     compare_energy,
     visualize_waveform_in_seconds,
 )
+
+console = Console()
+error_queue = Queue()
+error_lock = Lock()
 
 
 class BirdSongPreprocessor:
@@ -219,7 +237,12 @@ class BirdSongPreprocessor:
         return kept_waveform
 
     def process_audio(
-        self, audio_path, chunk_duration=3.0, overlap=0.5, visualization_dir=None
+        self,
+        audio_path,
+        chunk_duration=3.0,
+        overlap=0.5,
+        visualization_dir=None,
+        debug_mode=False,
     ):
         """
         Process audio file into mel spectrograms.
@@ -232,6 +255,8 @@ class BirdSongPreprocessor:
             audio_path: Path to audio file
             chunk_duration: Duration of each chunk in seconds
             overlap: Overlap between chunks (0.0-1.0)
+            visualization_dir: Directory to save visualizations
+            debug_mode: Whether to run in debug mode
 
         Returns:
         -------
@@ -255,23 +280,17 @@ class BirdSongPreprocessor:
         original_waveform = waveform
         waveform = self.remove_human_voice_using_silero(waveform)
 
-        # Compare energy before and after voice removal
-        compare_energy(original_waveform, waveform)
-
-        ######
-        # Visualize the waveform
-        ######
-        if visualization_dir:
-            filename = Path(audio_path).stem
-            visualization_path = os.path.join(
-                visualization_dir, f"{filename}_waveform.png"
-            )
-        else:
-            visualization_path = None
-
-        visualize_waveform_in_seconds(
-            original_waveform, waveform, sr, save_path=visualization_path
-        )
+        # Only do visualization and comparison in debug mode
+        if debug_mode:
+            compare_energy(original_waveform, waveform)
+            if visualization_dir:
+                filename = Path(audio_path).stem
+                visualization_path = os.path.join(
+                    visualization_dir, f"{filename}_waveform.png"
+                )
+                visualize_waveform_in_seconds(
+                    original_waveform, waveform, sr, save_path=visualization_path
+                )
 
         # Separate signal and noise
         signal_waveform, noise_waveform = self.separate_signal_noise(waveform)
@@ -327,47 +346,106 @@ class BirdSongPreprocessor:
         return signal_chunks, noise_chunks
 
 
+def process_single_file(args):
+    """
+    Process a single audio file. Helper function for parallel processing.
+
+    Args:
+        args: Tuple containing (audio_file, save_dir, folder, additional_meta)
+
+    Returns:
+        List of metadata entries for the processed file
+    """
+    audio_file, save_dir, folder, additional_meta = args
+    metadata_entries = []
+
+    try:
+        # Create preprocessor for this process
+        preprocessor = BirdSongPreprocessor()
+
+        # Create unique filenames for the processed specs
+        base_filename = Path(audio_file).stem
+        signal_dir = save_dir / folder / "signal"
+        noise_dir = save_dir / folder / "noise"
+
+        signal_dir.mkdir(exist_ok=True, parents=True)
+        noise_dir.mkdir(exist_ok=True, parents=True)
+
+        # Process audio file into chunks
+        signal_chunks, noise_chunks = preprocessor.process_audio(
+            audio_file, debug_mode=False
+        )
+
+        # Save signal chunks
+        for i, chunk in enumerate(signal_chunks):
+            chunk_file = signal_dir / f"{base_filename}_{i:03d}.pt"
+            torch.save(chunk, chunk_file)
+
+            meta_entry = {
+                "original_file": audio_file,
+                "processed_file": str(chunk_file),
+                "folder": folder,
+                "type": "signal",
+                "chunk_index": i,
+            }
+
+            for key, value in additional_meta.items():
+                if key not in meta_entry:
+                    meta_entry[f"train_{key}"] = value
+
+            metadata_entries.append(meta_entry)
+
+        # Save noise chunks
+        for i, chunk in enumerate(noise_chunks):
+            chunk_file = noise_dir / f"{base_filename}_{i:03d}.pt"
+            torch.save(chunk, chunk_file)
+
+            meta_entry = {
+                "original_file": audio_file,
+                "processed_file": str(chunk_file),
+                "folder": folder,
+                "type": "noise",
+                "chunk_index": i,
+            }
+
+            for key, value in additional_meta.items():
+                if key not in meta_entry:
+                    meta_entry[f"train_{key}"] = value
+
+            metadata_entries.append(meta_entry)
+
+    except Exception as e:
+        error_msg = f"Error processing {audio_file}: {str(e)}"
+        error_queue.put(error_msg)
+
+    return metadata_entries
+
+
 def prepare_batch(
     audio_files,
     metadata_path="data/train.csv",
     save_dir="train_audio_processed",
-    show_progress=True,
+    num_workers=None,  # None means use all available cores
 ):
     """
     Prepare a batch of audio files for model training or inference.
 
     Args:
-    ----
         audio_files (list): List of audio file paths
         metadata_path (str): Path to the train.csv file with additional metadata
         save_dir (str): Directory to save the processed audio files
-        show_progress (bool): Whether to show progress bars
-
+        num_workers (int): Number of parallel workers to use. None means use all available cores.
     """
+    import multiprocessing as mp
+
     # Create save_dir if it doesn't exist
     save_dir = Path("data", save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load train.csv metadata if available
-    train_metadata = {}
-    if metadata_path and os.path.exists(metadata_path):
-        try:
-            train_df = pd.read_csv(metadata_path)
-            for _, row in train_df.iterrows():
-                train_metadata[row["filename"]] = row.to_dict()
-            print(f"Loaded metadata for {len(train_metadata)} files from train.csv")
-        except Exception as e:
-            print(f"Error loading train.csv metadata: {e}")
+    # Initialize metadata_entries list
+    metadata_entries = []
 
-    # Create metadata file to store mapping
-    metadata = []
-    signal_specs = []
-    noise_specs = []
-
-    # Initialize preprocessor
-    preprocessor = BirdSongPreprocessor()
-
-    # Group files by folder for better progress tracking
+    # Group files by folder
     files_by_folder = {}
     for file in audio_files:
         folder = os.path.basename(os.path.dirname(file))
@@ -375,163 +453,295 @@ def prepare_batch(
             files_by_folder[folder] = []
         files_by_folder[folder].append(file)
 
-    # Process audio files
-    folder_iter = tqdm(
-        files_by_folder.items(),
-        desc="Processing folders",
-        disable=not show_progress,
+    # Load train.csv metadata if available
+    if metadata_path and os.path.exists(metadata_path):
+        try:
+            # Load train.csv with explicit schema matching all columns
+            train_metadata_df = pl.read_csv(
+                metadata_path,
+                schema={
+                    "primary_label": pl.Utf8,
+                    "secondary_labels": pl.Utf8,
+                    "type": pl.Utf8,
+                    "filename": pl.Utf8,
+                    "collection": pl.Utf8,
+                    "rating": pl.Float64,
+                    "url": pl.Utf8,
+                    "latitude": pl.Float64,
+                    "longitude": pl.Float64,
+                    "scientific_name": pl.Utf8,
+                    "common_name": pl.Utf8,
+                    "author": pl.Utf8,
+                    "license": pl.Utf8,
+                },
+                null_values=["", "['']", "None"],
+            )
+
+            # Clean data using Polars expressions
+            train_metadata_df = (
+                train_metadata_df.filter(
+                    pl.col("primary_label").is_not_null()
+                    & (pl.col("primary_label") != "")
+                )
+                .with_columns(
+                    [
+                        pl.col("secondary_labels").fill_null("[]"),
+                    ]
+                )
+                .select(["filename", "primary_label", "secondary_labels"])
+            )
+
+            # Convert to LazyFrame and cache the sorted result
+            train_metadata_df = train_metadata_df.lazy().sort("filename").cache()
+
+            console.print(
+                f"\n[green]Loaded metadata for {train_metadata_df.select(pl.len()).collect().item()} files from train.csv[/green]"
+            )
+
+            # Process each folder to collect metadata from existing processed files
+            for folder, folder_files in files_by_folder.items():
+                signal_dir = save_dir / folder / "signal"
+                noise_dir = save_dir / folder / "noise"
+
+                # Add signal files metadata
+                for audio_file in folder_files:
+                    rel_path = os.path.relpath(audio_file, "data/train_audio_data")
+                    filename = "/".join(rel_path.replace("\\", "/").split("/")[-2:])
+
+                    meta = (
+                        train_metadata_df.filter(pl.col("filename") == filename)
+                        .select(["primary_label", "secondary_labels"])
+                        .collect()
+                    )
+
+                    if meta.height > 0:
+                        meta_row = meta.row(0, named=True)  # Get as dictionary
+                    else:
+                        meta_row = {"primary_label": "", "secondary_labels": "[]"}
+
+                    signal_files = list(
+                        signal_dir.glob(f"{Path(audio_file).stem}_*.pt")
+                    )
+                    for file in signal_files:
+                        entry = {
+                            "original_file": audio_file,
+                            "processed_file": str(file),
+                            "folder": folder,
+                            "type": "signal",
+                            "chunk_index": int(file.stem.split("_")[-1]),
+                            "primary_label": meta_row["primary_label"],
+                            "secondary_labels": meta_row["secondary_labels"],
+                        }
+                        metadata_entries.append(entry)
+
+        except Exception as e:
+            console.print(f"[red]Error loading train.csv metadata: {e}[/red]")
+            raise
+
+    # Prepare arguments for parallel processing
+    process_args = []
+    for folder, folder_files in files_by_folder.items():
+        for audio_file in folder_files:
+            # Check if already processed
+            signal_dir = save_dir / folder / "signal"
+            signal_pattern = str(signal_dir / f"{Path(audio_file).stem}_*.pt")
+            if not glob.glob(signal_pattern):  # Only process if not already done
+                rel_path = os.path.relpath(audio_file, "data/train_audio_data")
+                filename = "/".join(rel_path.replace("\\", "/").split("/")[-2:])
+                meta = train_metadata_df.filter(pl.col("filename") == filename)
+                process_args.append((audio_file, save_dir, folder, meta))
+
+    # Create overall progress tracking
+    overall_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        expand=True,
+        transient=False,
     )
 
-    for folder, folder_files in folder_iter:
-        # Create folder if it doesn't exist
-        (save_dir / folder).mkdir(exist_ok=True)
+    # Create a function to get a new progress bar with consistent style
+    def create_progress():
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=True,
+        )
 
-        for audio_file in tqdm(
-            folder_files,
-            desc=f"Processing {folder}",
-            leave=False,
-            disable=not show_progress,
-        ):
-            # Create unique filenames for the processed specs
-            base_filename = Path(audio_file).stem
+    file_progress = create_progress()
+
+    # Get terminal size and adjust error panel size
+    terminal_height = console.size.height
+    error_panel_size = min(10, terminal_height // 3)
+
+    # Initialize error panel
+    error_panel = Panel(
+        "No errors yet",
+        title="Recent Errors",
+        border_style="red",
+        padding=(0, 1),
+    )
+
+    # Create progress group
+    progress_group = Group(overall_progress, file_progress, error_panel)
+
+    total_steps = 3  # 1. Process files 2. Collect metadata 3. Save results
+    overall_task = overall_progress.add_task("Overall progress", total=total_steps)
+
+    metadata_entries = []  # List to collect all metadata entries
+
+    with Live(
+        progress_group,
+        refresh_per_second=10,
+        console=console,
+        transient=False,
+        auto_refresh=False,
+    ) as live:
+        # Step 1: Process new files if any
+        if process_args:
+            file_task = file_progress.add_task(
+                "Processing new files", total=len(process_args)
+            )
+            errors = []
+
+            with mp.Pool(num_workers) as pool:
+                try:
+                    for result in pool.imap_unordered(
+                        process_single_file, process_args
+                    ):
+                        metadata_entries.extend(result)
+                        file_progress.update(file_task, advance=1)
+                        live.refresh()
+
+                        # Check for new errors
+                        while not error_queue.empty():
+                            error = error_queue.get()
+                            errors.append(error)
+                            error_messages = []
+                            for err in errors[-error_panel_size:]:
+                                max_width = console.width - 10
+                                if len(err) > max_width:
+                                    err = err[: max_width - 3] + "..."
+                                error_messages.append(err)
+
+                            error_panel.renderable = (
+                                "\n".join(error_messages)
+                                if error_messages
+                                else "No errors yet"
+                            )
+                            error_panel.title = f"Recent Errors ({len(errors)} total)"
+                            live.refresh()
+                finally:
+                    file_progress.update(file_task, completed=len(process_args))
+                    live.refresh()
+
+        overall_progress.update(overall_task, advance=1)
+        live.refresh()
+
+        # Step 2: Collect metadata from existing files
+        # Create new progress bar for metadata collection
+        file_progress = create_progress()
+        progress_group.renderables[1] = (
+            file_progress  # Update the progress bar in the group
+        )
+        file_task = file_progress.add_task(
+            "Collecting metadata from existing files", total=len(files_by_folder)
+        )
+        live.refresh()
+
+        # Metadata collection
+        for folder, folder_files in files_by_folder.items():
             signal_dir = save_dir / folder / "signal"
             noise_dir = save_dir / folder / "noise"
 
-            signal_dir.mkdir(exist_ok=True)
-            noise_dir.mkdir(exist_ok=True)
+            # Process all files in the folder at once
+            for audio_file in folder_files:
+                # Get metadata for this file
+                rel_path = os.path.relpath(audio_file, "data/train_audio_data")
+                filename = "/".join(rel_path.replace("\\", "/").split("/")[-2:])
 
-            # Check if already processed
-            signal_pattern = str(signal_dir / f"{base_filename}_*.pt")
-            existing_signal_files = glob.glob(signal_pattern)
-
-            # Get filename for metadata lookup
-            rel_path = os.path.relpath(audio_file, "data/train_audio_data")
-            filename = rel_path.replace("\\", "/")  # Normalize path separators
-            additional_meta = train_metadata.get(filename, {})
-
-            if existing_signal_files:
-                # Load existing spectrograms
-                for file in existing_signal_files:
-                    spec = torch.load(file)
-                    signal_specs.append(spec)
-
-                    # Create metadata entry with both sources
-                    meta_entry = {
-                        "original_file": audio_file,
-                        "processed_file": file,
-                        "folder": folder,
-                        "type": "signal",
-                    }
-
-                    # Add additional metadata from train.csv
-                    for key, value in additional_meta.items():
-                        if key not in meta_entry:  # Don't overwrite existing keys
-                            meta_entry[f"train_{key}"] = value
-
-                    metadata.append(meta_entry)
-
-                # Load existing noise specs if available
-                noise_pattern = str(noise_dir / f"{base_filename}_*.pt")
-                for file in glob.glob(noise_pattern):
-                    spec = torch.load(file)
-                    noise_specs.append(spec)
-
-                    # Create metadata entry with both sources
-                    meta_entry = {
-                        "original_file": audio_file,
-                        "processed_file": file,
-                        "folder": folder,
-                        "type": "noise",
-                    }
-
-                    # Add additional metadata from train.csv
-                    for key, value in additional_meta.items():
-                        if key not in meta_entry:  # Don't overwrite existing keys
-                            meta_entry[f"train_{key}"] = value
-
-                    metadata.append(meta_entry)
-
-                continue
-
-            try:
-                # Process audio file into chunks
-                signal_chunks, noise_chunks = preprocessor.process_audio(
-                    audio_file, visualization_dir="visualizations"
+                meta = (
+                    train_metadata_df.filter(pl.col("filename") == filename)
+                    .select(["primary_label", "secondary_labels"])
+                    .collect()
                 )
 
-                # Save signal chunks
-                for i, chunk in enumerate(signal_chunks):
-                    chunk_file = signal_dir / f"{base_filename}_{i:03d}.pt"
-                    torch.save(chunk, chunk_file)
-                    signal_specs.append(chunk)
+                if meta.height > 0:
+                    meta_row = meta.row(0, named=True)  # Get as dictionary
+                else:
+                    meta_row = {"primary_label": "", "secondary_labels": "[]"}
 
-                    # Create metadata entry with both sources
-                    meta_entry = {
+                # Get all processed files for this audio file
+                signal_files = list(signal_dir.glob(f"{Path(audio_file).stem}_*.pt"))
+                noise_files = list(noise_dir.glob(f"{Path(audio_file).stem}_*.pt"))
+
+                # Add signal files metadata
+                for file in signal_files:
+                    entry = {
                         "original_file": audio_file,
-                        "processed_file": str(chunk_file),
+                        "processed_file": str(file),
                         "folder": folder,
                         "type": "signal",
-                        "chunk_index": i,
+                        "chunk_index": int(file.stem.split("_")[-1]),
+                        "primary_label": meta_row["primary_label"],
+                        "secondary_labels": meta_row["secondary_labels"],
                     }
+                    metadata_entries.append(entry)
 
-                    # Add additional metadata from train.csv
-                    for key, value in additional_meta.items():
-                        if key not in meta_entry:  # Don't overwrite existing keys
-                            meta_entry[f"train_{key}"] = value
-
-                    metadata.append(meta_entry)
-
-                # Save noise chunks
-                for i, chunk in enumerate(noise_chunks):
-                    chunk_file = noise_dir / f"{base_filename}_{i:03d}.pt"
-                    torch.save(chunk, chunk_file)
-                    noise_specs.append(chunk)
-
-                    # Create metadata entry with both sources
-                    meta_entry = {
+                # Add noise files metadata with the same labels
+                for file in noise_files:
+                    entry = {
                         "original_file": audio_file,
-                        "processed_file": str(chunk_file),
+                        "processed_file": str(file),
                         "folder": folder,
                         "type": "noise",
-                        "chunk_index": i,
+                        "chunk_index": int(file.stem.split("_")[-1]),
+                        "primary_label": meta_row["primary_label"],
+                        "secondary_labels": meta_row["secondary_labels"],
                     }
+                    metadata_entries.append(entry)
 
-                    # Add additional metadata from train.csv
-                    for key, value in additional_meta.items():
-                        if key not in meta_entry:  # Don't overwrite existing keys
-                            meta_entry[f"train_{key}"] = value
+                file_progress.update(file_task, advance=1)
+                live.refresh()
 
-                    metadata.append(meta_entry)
+            overall_progress.update(overall_task, advance=1)
+            live.refresh()
 
-            except Exception as e:
-                print(f"\nError processing {audio_file}: {str(e)}")
-                continue
+        # Step 3: Save metadata
+        # Create new progress bar for saving
+        file_progress = create_progress()
+        progress_group.renderables[1] = (
+            file_progress  # Update the progress bar in the group
+        )
+        file_task = file_progress.add_task("Saving metadata to CSV", total=1)
+        live.refresh()
 
-    # Save metadata
-    metadata_df = pd.DataFrame(metadata)
-    metadata_df.to_csv(save_dir / "metadata.csv", index=False)
+        # Create DataFrame and save
+        metadata_df = pl.DataFrame(metadata_entries)
+        metadata_df.write_csv(save_dir / "metadata.csv")
 
-    # Print summary
-    print("\nProcessing Summary:")
-    print(f"Total signal chunks: {len(signal_specs)}")
-    print(f"Total noise chunks: {len(noise_specs)}")
-    print("Files per folder:")
-    folder_counts = metadata_df[metadata_df["type"] == "signal"][
-        "folder"
-    ].value_counts()
-    print(folder_counts.head().to_string())
+        file_progress.update(file_task, completed=1)
+        overall_progress.update(overall_task, advance=1)
+        live.refresh()
 
-    # Print metadata summary
-    if "train_rating" in metadata_df.columns:
-        print("\nMetadata Summary:")
-        print(f"Files with rating: {metadata_df['train_rating'].notna().sum()}")
-        print(f"Average rating: {metadata_df['train_rating'].mean():.2f}")
+        console.print("\n[bold blue]Processing Summary:[/bold blue]")
+        console.print(f"Total files processed: {len(metadata_df)}")
+        folder_counts = (
+            metadata_df.filter(pl.col("type") == "signal")
+            .group_by("folder")
+            .len()
+            .sort("len", descending=True)
+        )
+        console.print(folder_counts.head())
 
-    if "train_collection" in metadata_df.columns:
-        print("\nCollection Distribution:")
-        print(metadata_df["train_collection"].value_counts().to_string())
-
-    return signal_specs, noise_specs, metadata_df
+    return metadata_df
 
 
 if __name__ == "__main__":
